@@ -1,0 +1,350 @@
+import numpy as np
+import pandas as pd
+import netCDF4 as nc
+import matplotlib.pyplot as plt
+from scipy import stats
+from datetime import datetime, timedelta
+
+def calculate_nao_index_netcdf(file_path, start_year=1978, end_year=2022):
+    """
+    Calculate NAO index using netCDF4 directly.
+    """
+    print("=== NAO CALCULATION USING NETCDF4 ===")
+    
+    # Open the NetCDF file
+    dataset = nc.Dataset(file_path, 'r')
+    
+    # Read dimensions
+    time_var = dataset.variables['valid_time']
+    lat_var = dataset.variables['latitude']
+    lon_var = dataset.variables['longitude']
+    mslp_var = dataset.variables['msl']
+    
+    print(f"Dataset dimensions: time={len(time_var)}, lat={len(lat_var)}, lon={len(lon_var)}")
+    
+    # Convert time to datetime objects - handle cftime objects
+    times = nc.num2date(time_var[:], time_var.units)
+    
+    # Convert cftime to regular datetime
+    regular_times = []
+    for t in times:
+        if hasattr(t, 'year'):
+            regular_times.append(datetime(t.year, t.month, t.day, t.hour, t.minute, t.second))
+        else:
+            regular_times.append(t)
+    
+    # Find indices for our time period
+    start_date = datetime(start_year, 1, 1)
+    end_date = datetime(end_year, 12, 31)
+    
+    time_mask = (np.array(regular_times) >= start_date) & (np.array(regular_times) <= end_date)
+    time_indices = np.where(time_mask)[0]
+    
+    print(f"Selected time period: {start_date} to {end_date}")
+    print(f"Time indices: {len(time_indices)} months")
+    
+    # Get latitude and longitude values
+    latitudes = lat_var[:]
+    longitudes = lon_var[:]
+    
+    print(f"Latitude range: {latitudes.min():.1f} to {latitudes.max():.1f}")
+    print(f"Longitude range: {longitudes.min():.1f} to {longitudes.max():.1f}")
+    
+    # Convert longitude from 0-360 to -180 to 180 if needed
+    if longitudes.max() > 180:
+        print("Converting longitudes from 0-360 to -180-180...")
+        longitudes_converted = np.where(longitudes > 180, longitudes - 360, longitudes)
+    else:
+        longitudes_converted = longitudes.copy()
+    
+    # Define regions for Azores High and Icelandic Low
+    # Azores High region (35°N-45°N, 25°W-45°W)
+    azores_lat_mask = (latitudes <= 45) & (latitudes >= 35)
+    azores_lon_mask = (longitudes_converted >= -45) & (longitudes_converted <= -25)
+    
+    # Icelandic Low region (55°N-70°N, 25°W-45°W)
+    iceland_lat_mask = (latitudes <= 70) & (latitudes >= 55)
+    iceland_lon_mask = (longitudes_converted >= -45) & (longitudes_converted <= -25)
+    
+    azores_lat_indices = np.where(azores_lat_mask)[0]
+    azores_lon_indices = np.where(azores_lon_mask)[0]
+    iceland_lat_indices = np.where(iceland_lat_mask)[0]
+    iceland_lon_indices = np.where(iceland_lon_mask)[0]
+    
+    print(f"Azores region: {len(azores_lat_indices)} lats, {len(azores_lon_indices)} lons")
+    print(f"Iceland region: {len(iceland_lat_indices)} lats, {len(iceland_lon_indices)} lons")
+    
+    # Read MSLP data for the selected time period
+    print("Reading MSLP data...")
+    mslp_data = mslp_var[time_indices, :, :] / 100  # Convert Pa to hPa
+    
+    print(f"MSLP data shape: {mslp_data.shape}")
+    print(f"MSLP range: {mslp_data.min():.1f} to {mslp_data.max():.1f} hPa")
+    
+    # Calculate monthly anomalies
+    print("Calculating monthly anomalies...")
+    monthly_anom = calculate_monthly_anomalies(mslp_data, regular_times, time_indices)
+    
+    # Remove linear trend
+    print("Removing linear trend...")
+    detrended_data = remove_linear_trend_netcdf(monthly_anom)
+    
+    # Calculate NAO index
+    print("Calculating NAO index...")
+    nao_index = calculate_nao_from_regions(detrended_data, azores_lat_indices, azores_lon_indices, 
+                                         iceland_lat_indices, iceland_lon_indices, latitudes)
+    
+    # NORMALIZE THE NAO INDEX TO GET PROPER RANGE (-2 to +2)
+    print("Normalizing NAO index...")
+    nao_index_normalized = (nao_index - np.nanmean(nao_index)) / np.nanstd(nao_index)
+    
+    print(f"Raw NAO range: {np.nanmin(nao_index):.3f} to {np.nanmax(nao_index):.3f}")
+    print(f"Normalized NAO range: {np.nanmin(nao_index_normalized):.3f} to {np.nanmax(nao_index_normalized):.3f}")
+    
+    # Create time index for the NAO series using regular datetime objects
+    nao_times = [regular_times[i] for i in time_indices]
+    
+    # Convert to pandas Series with proper datetime index
+    nao_series = pd.Series(nao_index_normalized, index=nao_times, name='NAO_Index')
+    
+    # Remove any NaN values
+    nao_series = nao_series.dropna()
+    
+    print(f"NAO index calculated: {len(nao_series)} values")
+    if len(nao_series) > 0:
+        print(f"Final NAO range: {nao_series.min():.3f} to {nao_series.max():.3f}")
+    
+    # Calculate seasonal means
+    nao_seasonal = calculate_seasonal_nao_netcdf(nao_series)
+    
+    dataset.close()
+    
+    return nao_series, nao_seasonal
+
+def calculate_monthly_anomalies(mslp_data, times, time_indices):
+    """
+    Calculate monthly anomalies from climatology.
+    """
+    # Reshape data by month
+    n_times, n_lats, n_lons = mslp_data.shape
+    
+    # Group by month
+    monthly_clim = np.zeros((12, n_lats, n_lons))
+    monthly_anom = np.zeros_like(mslp_data)
+    
+    # Use only the times we have data for
+    selected_times = [times[i] for i in time_indices]
+    
+    for month in range(1, 13):
+        month_mask = np.array([t.month == month for t in selected_times])
+        monthly_data = mslp_data[month_mask, :, :]
+        
+        if len(monthly_data) > 0:
+            monthly_clim[month-1, :, :] = np.nanmean(monthly_data, axis=0)
+    
+    # Calculate anomalies
+    for i, t in enumerate(selected_times):
+        month = t.month - 1  # 0-based index
+        monthly_anom[i, :, :] = mslp_data[i, :, :] - monthly_clim[month, :, :]
+    
+    return monthly_anom
+
+def remove_linear_trend_netcdf(data):
+    """
+    Remove linear trend from 3D data.
+    """
+    n_times, n_lats, n_lons = data.shape
+    
+    # Calculate spatial mean for each time step
+    spatial_mean = np.nanmean(data, axis=(1, 2))
+    
+    # Remove trend from spatial mean
+    time_indices = np.arange(n_times)
+    valid_mask = ~np.isnan(spatial_mean)
+    
+    if np.sum(valid_mask) < 10:
+        print("WARNING: Not enough valid points for detrending")
+        return data
+    
+    slope, intercept, _, _, _ = stats.linregress(time_indices[valid_mask], spatial_mean[valid_mask])
+    trend = slope * time_indices + intercept
+    
+    # Remove trend from entire field (make a copy to avoid read-only issues)
+    detrended_data = data.copy() - trend[:, np.newaxis, np.newaxis]
+    
+    print(f"Trend removed: slope = {slope:.6f}")
+    
+    return detrended_data
+
+def calculate_nao_from_regions(data, azores_lat_idx, azores_lon_idx, iceland_lat_idx, iceland_lon_idx, latitudes):
+    """
+    Calculate NAO index from region means.
+    """
+    n_times = data.shape[0]
+    nao_index = np.zeros(n_times)
+    
+    # Calculate latitude weights (cosine of latitude)
+    lat_weights = np.cos(np.deg2rad(latitudes))
+    
+    for t in range(n_times):
+        try:
+            # Azores region mean (make copies to avoid read-only issues)
+            azores_region = data[t, azores_lat_idx[:, np.newaxis], azores_lon_idx].copy()
+            azores_weights = lat_weights[azores_lat_idx][:, np.newaxis].copy()
+            
+            # Calculate weighted mean
+            weighted_sum = np.nansum(azores_region * azores_weights)
+            weight_sum = np.nansum(azores_weights)
+            
+            if weight_sum > 0:
+                azores_mean = weighted_sum / weight_sum
+            else:
+                azores_mean = np.nan
+            
+            # Iceland region mean (make copies to avoid read-only issues)
+            iceland_region = data[t, iceland_lat_idx[:, np.newaxis], iceland_lon_idx].copy()
+            iceland_weights = lat_weights[iceland_lat_idx][:, np.newaxis].copy()
+            
+            # Calculate weighted mean
+            weighted_sum = np.nansum(iceland_region * iceland_weights)
+            weight_sum = np.nansum(iceland_weights)
+            
+            if weight_sum > 0:
+                iceland_mean = weighted_sum / weight_sum
+            else:
+                iceland_mean = np.nan
+            
+            # NAO index
+            if not np.isnan(azores_mean) and not np.isnan(iceland_mean):
+                nao_index[t] = azores_mean - iceland_mean
+            else:
+                nao_index[t] = np.nan
+                
+        except Exception as e:
+            print(f"Error at time step {t}: {e}")
+            nao_index[t] = np.nan
+    
+    return nao_index
+
+def calculate_seasonal_nao_netcdf(nao_monthly):
+    """
+    Calculate seasonal NAO index.
+    """
+    if len(nao_monthly) == 0:
+        return pd.Series([], dtype=float)
+    
+    seasonal_data = []
+    
+    # Season to representative month mapping
+    season_rep_month = {
+        'DJF': '02',
+        'MAM': '05', 
+        'JJA': '08',
+        'SON': '11'
+    }
+    
+    # Ensure index is datetime
+    if not isinstance(nao_monthly.index, pd.DatetimeIndex):
+        nao_monthly.index = pd.to_datetime(nao_monthly.index)
+    
+    for year in nao_monthly.index.year.unique():
+        for season, months in [('DJF', [12, 1, 2]), ('MAM', [3, 4, 5]), 
+                              ('JJA', [6, 7, 8]), ('SON', [9, 10, 11])]:
+            
+            if season == 'DJF':
+                if year == nao_monthly.index.year.min():
+                    continue
+                dec_data = nao_monthly[(nao_monthly.index.month == 12) & (nao_monthly.index.year == year-1)]
+                jan_feb_data = nao_monthly[(nao_monthly.index.month.isin([1, 2])) & (nao_monthly.index.year == year)]
+                season_data = pd.concat([dec_data, jan_feb_data])
+            else:
+                season_data = nao_monthly[(nao_monthly.index.month.isin(months)) & (nao_monthly.index.year == year)]
+            
+            if len(season_data) == 3:
+                rep_month = season_rep_month[season]
+                date = pd.Timestamp(f'{year}-{rep_month}-15')
+                seasonal_data.append({
+                    'date': date,
+                    'season': season,
+                    'nao_index': season_data.mean()
+                })
+    
+    if seasonal_data:
+        nao_seasonal = pd.DataFrame(seasonal_data).set_index('date')['nao_index']
+        print(f"Seasonal NAO: {len(nao_seasonal)} values")
+        return nao_seasonal
+    else:
+        print("No seasonal data")
+        return pd.Series([], dtype=float)
+
+def plot_nao_results(nao_monthly, nao_seasonal):
+    """
+    Plot NAO index results.
+    """
+    if len(nao_monthly) == 0:
+        print("No data to plot")
+        return
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+    
+    # Monthly plot
+    ax1.plot(nao_monthly.index, nao_monthly.values, 'b-', alpha=0.7, linewidth=0.8)
+    ax1.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+    ax1.set_ylabel('NAO Index')
+    ax1.set_title(f'Monthly NAO Index ({nao_monthly.index.year.min()}-{nao_monthly.index.year.max()})')
+    ax1.grid(True, alpha=0.3)
+    
+    # Seasonal plot
+    if len(nao_seasonal) > 0:
+        colors = {'DJF': 'blue', 'MAM': 'green', 'JJA': 'red', 'SON': 'orange'}
+        for season in ['DJF', 'MAM', 'JJA', 'SON']:
+            season_data = nao_seasonal[nao_seasonal.index.month == {'DJF': 2, 'MAM': 5, 'JJA': 8, 'SON': 11}[season]]
+            if len(season_data) > 0:
+                ax2.plot(season_data.index, season_data.values, 'o-', 
+                        color=colors[season], label=season, markersize=4)
+        
+        ax2.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+        ax2.set_ylabel('NAO Index')
+        ax2.set_title('Seasonal NAO Index')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+    else:
+        ax2.text(0.5, 0.5, 'No seasonal data available', transform=ax2.transAxes, 
+                ha='center', va='center', fontsize=12)
+        ax2.set_title('Seasonal NAO Index', fontsize=14)
+    
+    plt.tight_layout()
+    plt.savefig('nao_index_netcdf.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+# Main execution
+if __name__ == "__main__":
+    file_path = "C:/Users/moham/OneDrive/Documents/Climate_Project/dadefda24611707dd32599a670df250b.nc"
+    
+    try:
+        nao_monthly, nao_seasonal = calculate_nao_index_netcdf(file_path)
+        
+        if len(nao_monthly) > 0:
+            print(f"\n=== NAO STATISTICS ===")
+            print(f"Period: {nao_monthly.index[0].strftime('%Y-%m')} to {nao_monthly.index[-1].strftime('%Y-%m')}")
+            print(f"Mean: {nao_monthly.mean():.3f}")
+            print(f"Std:  {nao_monthly.std():.3f}")
+            print(f"Min:  {nao_monthly.min():.3f}")
+            print(f"Max:  {nao_monthly.max():.3f}")
+            
+            # Save results
+            nao_monthly.to_csv("nao_monthly_netcdf.csv")
+            if len(nao_seasonal) > 0:
+                nao_seasonal.to_csv("nao_seasonal_netcdf.csv")
+            
+            # Plot results
+            plot_nao_results(nao_monthly, nao_seasonal)
+            
+            print("\nResults saved to CSV files and plot saved as 'nao_index_netcdf.png'")
+        else:
+            print("ERROR: No NAO data calculated")
+            
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()

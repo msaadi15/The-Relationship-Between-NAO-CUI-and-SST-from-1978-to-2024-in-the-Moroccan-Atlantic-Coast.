@@ -1,0 +1,554 @@
+import numpy as np
+import pandas as pd
+import netCDF4 as nc
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from scipy.stats import linregress
+from datetime import datetime
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+# ================================
+# 1. LOAD EXISTING SEASONAL DATA
+# ================================
+
+def load_seasonal_data(data_path):
+    """Load seasonal data from CSV files"""
+    print("=== LOADING SEASONAL DATA FROM CSV FILES ===")
+    
+    seasonal_data = {}
+    seasons = ['DJF', 'MAM', 'JJA', 'SON']
+    
+    for season in seasons:
+        csv_file = os.path.join(data_path, f"moroccan_seasonal_{season}.csv")
+        if os.path.exists(csv_file):
+            df = pd.read_csv(csv_file)
+            seasonal_data[season] = df
+            print(f"  Loaded {season}: {len(df)} years ({df['Year'].min()}-{df['Year'].max()})")
+        else:
+            print(f"  Warning: {csv_file} not found")
+    
+    return seasonal_data
+
+# ================================
+# 2. LINEAR TREND ANALYSIS (1978-2024)
+# ================================
+
+def calculate_climate_trends(seasonal_data):
+    """Calculate climate trends 1978-2024 per decade"""
+    print("=== CALCULATING CLIMATE TRENDS 1978-2024 ===")
+    
+    trends = {}
+    trend_results = []
+    
+    for season, df in seasonal_data.items():
+        if len(df) < 5:  # Minimum 5 points for regression
+            continue
+            
+        years = df['Year'].values
+        
+        # Calculate trends with p-values
+        nao_slope, nao_intercept, nao_r, nao_p, nao_std = linregress(years, df['NAO'])
+        upw_slope, upw_intercept, upw_r, upw_p, upw_std = linregress(years, df['Upwelling'])
+        sst_slope, sst_intercept, sst_r, sst_p, sst_std = linregress(years, df['SST'])
+        
+        # Convert to per decade
+        nao_trend = nao_slope * 10
+        upwelling_trend = upw_slope * 10  
+        sst_trend = sst_slope * 10
+        
+        trends[season] = {
+            'NAO_trend': nao_trend, 'NAO_p': nao_p, 'NAO_r2': nao_r**2,
+            'Upwelling_trend': upwelling_trend, 'Upwelling_p': upw_p, 'Upwelling_r2': upw_r**2,
+            'SST_trend': sst_trend, 'SST_p': sst_p, 'SST_r2': sst_r**2
+        }
+        
+        trend_results.append({
+            'Season': season,
+            'Period': f"{years[0]}-{years[-1]}",
+            'NAO_trend': f"{nao_trend:+.4f}",
+            'NAO_signif': '*' if nao_p < 0.05 else '',
+            'Upwelling_trend': f"{upwelling_trend:+.4f}", 
+            'Upwelling_signif': '*' if upw_p < 0.05 else '',
+            'SST_trend': f"{sst_trend:+.4f}",
+            'SST_signif': '*' if sst_p < 0.05 else ''
+        })
+        
+        print(f"  {season}: NAO={nao_trend:+.4f}/decade{'*' if nao_p < 0.05 else ''}, "
+              f"Upwelling={upwelling_trend:+.4f}/decade{'*' if upw_p < 0.05 else ''}, "
+              f"SST={sst_trend:+.4f}/decade{'*' if sst_p < 0.05 else ''}")
+    
+    # Save results
+    output_path = "C:/Users/moham/OneDrive/Documents/Climate_Project/"
+    trend_df = pd.DataFrame(trend_results)
+    trend_df.to_csv(os.path.join(output_path, "climate_trends_summary.csv"), index=False)
+    print("Trends saved to climate_trends_summary.csv")
+    
+    return trends, trend_df
+
+def plot_climate_trends(seasonal_data, trends):
+    """Visualize climate trends"""
+    print("=== CREATING TREND PLOTS ===")
+    
+    seasons = ['DJF', 'MAM', 'JJA', 'SON']
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    axes = axes.flatten()
+    
+    for idx, season in enumerate(seasons):
+        if season not in seasonal_data:
+            continue
+            
+        df = seasonal_data[season]
+        ax = axes[idx]
+        
+        # Plot curves with trends
+        years = df['Year']
+        
+        # NAO
+        nao_trend = trends[season]['NAO_trend'] / 10  # Per year for plotting
+        ax.plot(years, df['NAO'], 'b-', alpha=0.7, label='NAO', linewidth=1)
+        ax.plot(years, nao_trend * (years - years.min()) + df['NAO'].mean(), 
+                'b--', linewidth=2, label=f'NAO trend: {trends[season]["NAO_trend"]:+.3f}/decade')
+        
+        # Upwelling
+        upw_trend = trends[season]['Upwelling_trend'] / 10
+        ax.plot(years, df['Upwelling'], 'g-', alpha=0.7, label='Upwelling', linewidth=1)
+        ax.plot(years, upw_trend * (years - years.min()) + df['Upwelling'].mean(),
+                'g--', linewidth=2, label=f'Upwelling trend: {trends[season]["Upwelling_trend"]:+.3f}/decade')
+        
+        # SST
+        sst_trend = trends[season]['SST_trend'] / 10
+        ax.plot(years, df['SST'], 'r-', alpha=0.7, label='SST', linewidth=1)
+        ax.plot(years, sst_trend * (years - years.min()) + df['SST'].mean(),
+                'r--', linewidth=2, label=f'SST trend: {trends[season]["SST_trend"]:+.3f}/decade')
+        
+        ax.set_title(f'Climate Trends - {season}\n(1978-2024)', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Year')
+        ax.set_ylabel('Normalized Index')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Add significance annotation
+        sig_text = []
+        if trends[season]['NAO_p'] < 0.05:
+            sig_text.append("NAO*")
+        if trends[season]['Upwelling_p'] < 0.05:
+            sig_text.append("Upwelling*")
+        if trends[season]['SST_p'] < 0.05:
+            sig_text.append("SST*")
+            
+        if sig_text:
+            ax.text(0.02, 0.98, f"Significant: {', '.join(sig_text)}", 
+                   transform=ax.transAxes, fontsize=10, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    plt.tight_layout()
+    output_path = "C:/Users/moham/OneDrive/Documents/Climate_Project/"
+    plt.savefig(os.path.join(output_path, 'climate_trends_1978_2024.png'), dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return fig
+
+# ================================
+# 3. SST TREND MAPS 1978-2024
+# ================================
+
+def plot_sst_trend_maps(sst_file, start_year=1978, end_year=2022):
+    """Maps showing coastal warming/cooling trends"""
+    print("=== CREATING SST TREND MAPS ===")
+    
+    dataset = nc.Dataset(sst_file, 'r')
+    
+    # Read data
+    time_var = dataset.variables['valid_time']
+    lat_var = dataset.variables['latitude'][:]
+    lon_var = dataset.variables['longitude'][:]
+    sst_data = dataset.variables['sst']
+    
+    # Time conversion - FIXED: Convert to list first
+    times = nc.num2date(time_var[:], time_var.units)
+    regular_times = []
+    for t in times:
+        if hasattr(t, 'year'):
+            regular_times.append(datetime(t.year, t.month, t.day))
+        else:
+            regular_times.append(t)
+    
+    # Convert to numpy array for indexing
+    regular_times = np.array(regular_times)
+    
+    # Longitude conversion
+    lon_var = np.where(lon_var > 180, lon_var - 360, lon_var)
+    
+    # Time filter
+    start_date = datetime(start_year, 1, 1)
+    end_date = datetime(end_year, 12, 31)
+    time_mask = (regular_times >= start_date) & (regular_times <= end_date)
+    time_indices = np.where(time_mask)[0]
+    
+    print(f"  Period: {start_year}-{end_year} ({len(time_indices)} time steps)")
+    
+    # Study region
+    lat_min, lat_max = 20, 42
+    lon_min, lon_max = -30, -5
+    
+    lat_idx = np.where((lat_var >= lat_min) & (lat_var <= lat_max))[0]
+    lon_idx = np.where((lon_var >= lon_min) & (lon_var <= lon_max))[0]
+    
+    lats_region = lat_var[lat_idx]
+    lons_region = lon_var[lon_idx]
+    
+    # Calculate trends per pixel
+    print("  Calculating SST trends per pixel...")
+    trend_map = np.full((len(lat_idx), len(lon_idx)), np.nan)
+    pvalue_map = np.full((len(lat_idx), len(lon_idx)), np.nan)
+    
+    # FIXED: Proper indexing for time extraction
+    years = np.array([t.year for t in regular_times[time_indices]])
+    unique_years = np.unique(years)
+    
+    # Annual aggregation - process in chunks to avoid memory issues
+    sst_annual = np.full((len(unique_years), len(lat_idx), len(lon_idx)), np.nan)
+    
+    print(f"  Processing {len(unique_years)} years of data...")
+    
+    for i, year in enumerate(unique_years):
+        year_mask = np.array([t.year == year for t in regular_times[time_indices]])
+        year_indices = time_indices[year_mask]
+        
+        if len(year_indices) >= 6:  # At least 6 months of data
+            try:
+                # Load data for this year only
+                sst_year_data = []
+                for idx in year_indices:
+                    sst_slice = sst_data[idx, :, :]
+                    # Kelvin to Celsius conversion
+                    if sst_slice.max() > 200:
+                        sst_slice = sst_slice - 273.15
+                    sst_region = sst_slice[lat_idx[:, None], lon_idx]
+                    if not np.all(np.isnan(sst_region)):
+                        sst_year_data.append(sst_region)
+                
+                if sst_year_data:
+                    sst_annual[i] = np.nanmean(sst_year_data, axis=0)
+            except Exception as e:
+                print(f"    Warning: Could not process year {year}: {e}")
+                continue
+    
+    # Linear regression per pixel
+    print("  Performing linear regression...")
+    valid_pixels = 0
+    
+    for i in range(len(lat_idx)):
+        for j in range(len(lon_idx)):
+            sst_ts = sst_annual[:, i, j]
+            valid_mask = ~np.isnan(sst_ts)
+            
+            if np.sum(valid_mask) > 15:  # At least 15 years of data
+                try:
+                    slope, intercept, r_value, p_value, std_err = linregress(unique_years[valid_mask], sst_ts[valid_mask])
+                    trend_map[i, j] = slope * 10  # °C per decade
+                    pvalue_map[i, j] = p_value
+                    valid_pixels += 1
+                except:
+                    continue
+    
+    dataset.close()
+    
+    print(f"  Processed {valid_pixels} valid pixels")
+    
+    # Create map
+    print("  Generating map...")
+    fig = plt.figure(figsize=(15, 10))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+    
+    # Map background
+    ax.add_feature(cfeature.LAND, color='lightgray', zorder=1)
+    ax.add_feature(cfeature.OCEAN, color='white', zorder=0)
+    ax.add_feature(cfeature.COASTLINE, linewidth=1.0, zorder=2)
+    
+    # Trend levels
+    levels = np.arange(-0.5, 0.51, 0.05)  # -0.5°C to +0.5°C per decade
+    
+    # Mask for significant trends (p < 0.05)
+    trend_signif = np.where(pvalue_map < 0.05, trend_map, np.nan)
+    
+    # Plot trend
+    lon_grid, lat_grid = np.meshgrid(lons_region, lats_region)
+    cf = ax.contourf(lon_grid, lat_grid, trend_map, levels=levels, 
+                     cmap='RdBu_r', extend='both', transform=ccrs.PlateCarree(), alpha=0.8)
+    
+    # Contours for significant trends
+    contour_levels = [-0.3, -0.1, 0.1, 0.3]
+    cs = ax.contour(lon_grid, lat_grid, trend_signif, levels=contour_levels, 
+                    colors='black', linewidths=1.5, transform=ccrs.PlateCarree())
+    plt.clabel(cs, inline=True, fontsize=10, fmt='%.1f')
+    
+    # Hatching for significant areas
+    if np.any(~np.isnan(trend_signif)):
+        sig_mask = ~np.isnan(trend_signif)
+        ax.contourf(lon_grid, lat_grid, np.where(sig_mask, 1, 0), 
+                    levels=[0.5, 1.5], colors='none', 
+                    hatches=['...'], transform=ccrs.PlateCarree(), alpha=0)
+    
+    # Coastal cities
+    cities = {
+        'Dakhla': (23.71, -15.93), 'Boujdour': (26.13, -14.48), 'Laayoune': (27.15, -13.20),
+        'Tan-Tan': (28.43, -11.10), 'Sidi Ifni': (29.38, -10.18), 'Agadir': (30.42, -9.58),
+        'Essaouira': (31.51, -9.77), 'Safi': (32.30, -9.24), 'Casablanca': (33.57, -7.59),
+        'Kenitra': (34.25, -6.58), 'Tangier': (35.78, -5.81), 'Lisbon': (38.72, -9.14)
+    }
+    
+    for city, (lat, lon) in cities.items():
+        ax.plot(lon, lat, 'ko', markersize=4, transform=ccrs.PlateCarree(), zorder=3)
+        ax.text(lon + 0.2, lat + 0.1, city, fontsize=8, transform=ccrs.PlateCarree(),
+                bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.8), zorder=3)
+    
+    # Grid
+    gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle='--')
+    gl.top_labels = gl.right_labels = False
+    
+    # Colorbar
+    cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.05, shrink=0.8)
+    cbar.set_label('SST Trend (°C/decade)', fontsize=12, fontweight='bold')
+    
+    # Statistics
+    valid_trends = trend_map[~np.isnan(trend_map)]
+    if len(valid_trends) > 0:
+        mean_trend = np.nanmean(valid_trends)
+        cooling_area = np.sum(trend_map < 0) / len(valid_trends) * 100
+        warming_area = np.sum(trend_map > 0) / len(valid_trends) * 100
+        significant_area = np.sum(pvalue_map < 0.05) / len(valid_trends) * 100
+    else:
+        mean_trend = np.nan
+        cooling_area = 0
+        warming_area = 0
+        significant_area = 0
+    
+    ax.set_title(f'SST Trends {start_year}-{end_year}\n'
+                f'Mean: {mean_trend:+.3f}°C/decade | '
+                f'Cooling: {cooling_area:.1f}% | '
+                f'Warming: {warming_area:.1f}% | '
+                f'Significant: {significant_area:.1f}%', 
+                fontsize=12, fontweight='bold', pad=20)
+    
+    plt.tight_layout()
+    output_path = "C:/Users/moham/OneDrive/Documents/Climate_Project/"
+    plt.savefig(os.path.join(output_path, 'sst_trends_map_1978_2024.png'), dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    print(f"  Mean SST trend: {mean_trend:+.3f}°C/decade")
+    print(f"  Cooling areas: {cooling_area:.1f}%")
+    print(f"  Warming areas: {warming_area:.1f}%")
+    print(f"  Significant areas: {significant_area:.1f}%")
+    
+    return trend_map, pvalue_map
+
+# ================================
+# 4. CHANGE POINT ANALYSIS
+# ================================
+
+def detect_climate_shift(seasonal_data):
+    """Detect change points in time series"""
+    print("=== CLIMATE CHANGE POINT ANALYSIS ===")
+    
+    try:
+        from ruptures import Binseg
+    except ImportError:
+        print("  Required installation: pip install ruptures")
+        print("  Skipping change point analysis")
+        return None
+    
+    results = {}
+    
+    for season in ['DJF', 'MAM', 'JJA', 'SON']:
+        if season not in seasonal_data:
+            continue
+            
+        df = seasonal_data[season]
+        years = df['Year'].values
+        
+        # Analysis for each variable
+        variables = ['NAO', 'Upwelling', 'SST']
+        season_results = {}
+        
+        for var in variables:
+            data = df[var].values
+            
+            # Normalization
+            data_norm = (data - np.mean(data)) / np.std(data)
+            
+            # Change point detection
+            try:
+                # Binseg algorithm
+                algo = Binseg(model="rbf", min_size=5).fit(data_norm.reshape(-1, 1))
+                change_points = algo.predict(n_bkps=1)  # Maximum 1 change point for clarity
+                
+                # Convert to years
+                change_years = [years[cp-1] for cp in change_points if cp < len(years)]
+                
+                season_results[var] = {
+                    'change_points': change_points,
+                    'change_years': change_years,
+                    'data': data_norm
+                }
+                
+                if change_years:
+                    print(f"  {season} {var}: Change points detected in {change_years}")
+                else:
+                    print(f"  {season} {var}: No significant change points detected")
+                
+            except Exception as e:
+                print(f"  Error {season} {var}: {e}")
+                season_results[var] = {'change_points': [], 'change_years': [], 'data': data_norm}
+        
+        results[season] = season_results
+    
+    # Visualize change points
+    plot_climate_change_points(results, seasonal_data)
+    
+    return results
+
+def plot_climate_change_points(change_point_results, seasonal_data):
+    """Visualize climate change points"""
+    print("=== CREATING CHANGE POINT PLOTS ===")
+    
+    if change_point_results is None:
+        print("  No change point results to plot")
+        return None
+    
+    seasons = ['DJF', 'MAM', 'JJA', 'SON']
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    axes = axes.flatten()
+    
+    for idx, season in enumerate(seasons):
+        if season not in change_point_results:
+            continue
+            
+        ax = axes[idx]
+        df = seasonal_data[season]
+        years = df['Year'].values
+        
+        # Colors for each variable
+        colors = {'NAO': 'blue', 'Upwelling': 'green', 'SST': 'red'}
+        
+        for var, color in colors.items():
+            if var in change_point_results[season]:
+                data = change_point_results[season][var]['data']
+                change_years = change_point_results[season][var]['change_years']
+                
+                # Plot normalized series
+                ax.plot(years, data, color=color, label=var, linewidth=2, alpha=0.8)
+                
+                # Vertical lines for change points
+                for cp_year in change_years:
+                    ax.axvline(x=cp_year, color=color, linestyle='--', alpha=0.7, 
+                              linewidth=1.5, label=f'{var} change {cp_year}')
+        
+        ax.set_title(f'Climate Change Points - {season}', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Year')
+        ax.set_ylabel('Normalized Variable')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Add reference periods
+        ax.axvspan(1978, 2000, alpha=0.1, color='gray', label='Period 1978-2000')
+        ax.axvspan(2001, 2024, alpha=0.1, color='yellow', label='Period 2001-2024')
+    
+    plt.tight_layout()
+    output_path = "C:/Users/moham/OneDrive/Documents/Climate_Project/"
+    plt.savefig(os.path.join(output_path, 'climate_change_points_analysis.png'), dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return fig
+
+# ================================
+# MAIN EXECUTION FUNCTION
+# ================================
+
+def analyze_climate_change_complete(data_path, sst_file_path):
+    """Complete climate change analysis from existing CSV files"""
+    print("="*80)
+    print("CLIMATE CHANGE ANALYSIS 1978-2024")
+    print("="*80)
+    
+    # 1. Load existing seasonal data
+    seasonal_data = load_seasonal_data(data_path)
+    
+    if not seasonal_data:
+        print("Error: No seasonal data found. Please check your CSV files.")
+        return None
+    
+    # 2. Linear trends
+    print("\n1. CALCULATING LINEAR TRENDS")
+    trends, trend_df = calculate_climate_trends(seasonal_data)
+    plot_climate_trends(seasonal_data, trends)
+    
+    # 3. SST trend maps
+    print("\n2. CREATING SST TREND MAPS")
+    try:
+        sst_trend_map, sst_pvalue_map = plot_sst_trend_maps(sst_file_path)
+    except Exception as e:
+        print(f"Error creating SST trend maps: {e}")
+        print("Skipping SST trend maps...")
+        sst_trend_map, sst_pvalue_map = None, None
+    
+    # 4. Change point analysis
+    print("\n3. CHANGE POINT ANALYSIS")
+    change_point_results = detect_climate_shift(seasonal_data)
+    
+    # Results summary
+    print("\n" + "="*80)
+    print("RESULTS SUMMARY - CLIMATE CHANGE")
+    print("="*80)
+    
+    # Average annual trends
+    annual_trends = {}
+    for var in ['NAO', 'Upwelling', 'SST']:
+        var_trends = [trends[s][f'{var}_trend'] for s in trends]
+        annual_trends[var] = np.mean(var_trends)
+        print(f"  {var}: {annual_trends[var]:+.4f} units/decade (seasonal average)")
+    
+    # Key findings
+    print("\nKEY FINDINGS:")
+    print(f"  Upwelling trend: {annual_trends['Upwelling']:+.4f} units/decade")
+    print(f"  SST trend: {annual_trends['SST']:+.4f} units/decade") 
+    print(f"  Climate paradox: Global warming vs local cooling in upwelling zones")
+    
+    return {
+        'seasonal_data': seasonal_data,
+        'trends': trends,
+        'trend_df': trend_df,
+        'sst_trend_map': sst_trend_map,
+        'change_point_results': change_point_results
+    }
+
+# ================================
+# EXECUTION
+# ================================
+
+if __name__ == "__main__":
+    # Set your paths
+    data_path = "C:/Users/moham/OneDrive/Documents/Climate_Project/"
+    sst_file_path = "C:/Users/moham/OneDrive/Documents/Climate_Project/dadefda24611707dd32599a670df250b.nc"
+    
+    print("Climate change analysis starting...")
+    print(f"Data path: {data_path}")
+    print(f"SST file: {sst_file_path}")
+    
+    # Run complete analysis
+    results = analyze_climate_change_complete(data_path, sst_file_path)
+    
+    if results:
+        print("\nAnalysis completed successfully!")
+        print("Generated files:")
+        print("  - climate_trends_summary.csv")
+        print("  - climate_trends_1978_2024.png") 
+        print("  - sst_trends_map_1978_2024.png")
+        print("  - climate_change_points_analysis.png")
+    else:
+        print("\nAnalysis failed. Please check your file paths.")

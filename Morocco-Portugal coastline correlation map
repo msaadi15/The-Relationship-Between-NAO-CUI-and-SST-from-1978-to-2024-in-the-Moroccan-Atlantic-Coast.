@@ -1,0 +1,489 @@
+import numpy as np
+import pandas as pd
+import netCDF4 as nc
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from scipy.stats import pearsonr
+from datetime import datetime
+
+def calculate_nao_index_netcdf_simple(file_path, start_year=1978, end_year=2022):
+    """
+    Simple NAO calculation that returns just the monthly series
+    """
+    print("=== CALCULATING NAO INDEX (SIMPLIFIED) ===")
+    
+    dataset = nc.Dataset(file_path, 'r')
+    
+    # Read dimensions
+    time_var = dataset.variables['valid_time']
+    lat_var = dataset.variables['latitude']
+    lon_var = dataset.variables['longitude']
+    mslp_var = dataset.variables['msl']
+    
+    # Convert time to datetime objects
+    times = nc.num2date(time_var[:], time_var.units)
+    regular_times = []
+    for t in times:
+        if hasattr(t, 'year'):
+            regular_times.append(datetime(t.year, t.month, t.day, t.hour, t.minute, t.second))
+        else:
+            regular_times.append(t)
+    
+    # Find indices for our time period
+    start_date = datetime(start_year, 1, 1)
+    end_date = datetime(end_year, 12, 31)
+    time_mask = (np.array(regular_times) >= start_date) & (np.array(regular_times) <= end_date)
+    time_indices = np.where(time_mask)[0]
+    
+    # Get coordinates
+    latitudes = lat_var[:]
+    longitudes = lon_var[:]
+    
+    # Convert longitude if needed
+    if longitudes.max() > 180:
+        longitudes_converted = np.where(longitudes > 180, longitudes - 360, longitudes)
+    else:
+        longitudes_converted = longitudes.copy()
+    
+    # Define regions
+    azores_lat_mask = (latitudes <= 45) & (latitudes >= 35)
+    azores_lon_mask = (longitudes_converted >= -45) & (longitudes_converted <= -25)
+    iceland_lat_mask = (latitudes <= 70) & (latitudes >= 55)
+    iceland_lon_mask = (longitudes_converted >= -45) & (longitudes_converted <= -25)
+    
+    azores_lat_indices = np.where(azores_lat_mask)[0]
+    azores_lon_indices = np.where(azores_lon_mask)[0]
+    iceland_lat_indices = np.where(iceland_lat_mask)[0]
+    iceland_lon_indices = np.where(iceland_lon_mask)[0]
+    
+    # Read and process MSLP data
+    mslp_data = mslp_var[time_indices, :, :] / 100  # Convert Pa to hPa
+    
+    # Calculate monthly anomalies
+    n_times, n_lats, n_lons = mslp_data.shape
+    monthly_clim = np.zeros((12, n_lats, n_lons))
+    monthly_anom = np.zeros_like(mslp_data)
+    
+    selected_times = [regular_times[i] for i in time_indices]
+    
+    for month in range(1, 13):
+        month_mask = np.array([t.month == month for t in selected_times])
+        monthly_data = mslp_data[month_mask, :, :]
+        if len(monthly_data) > 0:
+            monthly_clim[month-1, :, :] = np.nanmean(monthly_data, axis=0)
+    
+    for i, t in enumerate(selected_times):
+        month = t.month - 1
+        monthly_anom[i, :, :] = mslp_data[i, :, :] - monthly_clim[month, :, :]
+    
+    # Calculate NAO index
+    lat_weights = np.cos(np.deg2rad(latitudes))
+    n_times = monthly_anom.shape[0]
+    nao_index = np.zeros(n_times)
+    
+    for t in range(n_times):
+        azores_region = monthly_anom[t, azores_lat_indices[:, np.newaxis], azores_lon_indices].copy()
+        azores_weights = lat_weights[azores_lat_indices][:, np.newaxis].copy()
+        weighted_sum = np.nansum(azores_region * azores_weights)
+        weight_sum = np.nansum(azores_weights)
+        azores_mean = weighted_sum / weight_sum if weight_sum > 0 else np.nan
+        
+        iceland_region = monthly_anom[t, iceland_lat_indices[:, np.newaxis], iceland_lon_indices].copy()
+        iceland_weights = lat_weights[iceland_lat_indices][:, np.newaxis].copy()
+        weighted_sum = np.nansum(iceland_region * iceland_weights)
+        weight_sum = np.nansum(iceland_weights)
+        iceland_mean = weighted_sum / weight_sum if weight_sum > 0 else np.nan
+        
+        if not np.isnan(azores_mean) and not np.isnan(iceland_mean):
+            nao_index[t] = azores_mean - iceland_mean
+        else:
+            nao_index[t] = np.nan
+    
+    # Normalize
+    nao_index_normalized = (nao_index - np.nanmean(nao_index)) / np.nanstd(nao_index)
+    
+    # Create time series
+    nao_times = [regular_times[i] for i in time_indices]
+    nao_series = pd.Series(nao_index_normalized, index=nao_times, name='NAO_Index')
+    nao_series = nao_series.dropna()
+    
+    dataset.close()
+    
+    print(f"NAO index calculated: {len(nao_series)} values")
+    return nao_series
+
+def get_djf_nao_data(nao_monthly):
+    """
+    Extract DJF seasonal means from monthly NAO data
+    """
+    seasonal_data = []
+    
+    for year in sorted(nao_monthly.index.year.unique()):
+        if year == nao_monthly.index.year.min():
+            continue
+        
+        # DJF: Dec (prev year) + Jan, Feb (current year)
+        dec_data = nao_monthly[(nao_monthly.index.month == 12) & (nao_monthly.index.year == year-1)]
+        jan_feb_data = nao_monthly[(nao_monthly.index.month.isin([1, 2])) & (nao_monthly.index.year == year)]
+        season_data = pd.concat([dec_data, jan_feb_data])
+        
+        if len(season_data) == 3:
+            seasonal_data.append(season_data.mean())
+    
+    nao_djf = pd.Series(seasonal_data)
+    print(f"Extracted {len(nao_djf)} DJF NAO values")
+    return nao_djf.values
+
+def create_comprehensive_ocean_mask(latitudes, longitudes):
+    """
+    Create a comprehensive ocean mask that properly excludes ALL land areas
+    focusing on the Morocco-Portugal coastline region
+    """
+    ocean_mask = np.ones((len(latitudes), len(longitudes)), dtype=bool)
+    
+    for i in range(len(latitudes)):
+        for j in range(len(longitudes)):
+            lat = latitudes[i]
+            lon = longitudes[j]
+            
+            # Check if point is land - Focus on Morocco-Portugal coastline
+            is_land = False
+            
+            # Portugal coastline
+            if (lat >= 36.5 and lat <= 42.0 and lon >= -9.5 and lon <= -6.0):
+                # Coastal Portugal regions
+                if (lat >= 37.0 and lat <= 38.5 and lon >= -9.0 and lon <= -8.0):  # Lisbon region
+                    is_land = True
+                elif (lat >= 38.5 and lat <= 41.5 and lon >= -9.0 and lon <= -6.0):  # Northern Portugal coast
+                    is_land = True
+                elif (lat >= 36.5 and lat <= 37.5 and lon >= -8.5 and lon <= -7.5):  # Algarve region
+                    is_land = True
+            
+            # Southern Spain coastline near Gibraltar
+            if (lat >= 35.5 and lat <= 36.5 and lon >= -5.8 and lon <= -5.0):
+                is_land = True
+            
+            # Morocco coastline from 5°W to 10°W
+            # Northern Morocco coast - Tangier to Casablanca
+            if (lat >= 33.0 and lat <= 36.0 and lon >= -10.0 and lon <= -5.0):
+                # Coastal regions
+                if (lat >= 35.5 and lat <= 36.0 and lon >= -6.0 and lon <= -5.0):  # Tangier region
+                    is_land = True
+                elif (lat >= 34.0 and lat <= 35.0 and lon >= -7.0 and lon <= -6.0):  # Rabat region
+                    is_land = True
+                elif (lat >= 33.5 and lat <= 34.0 and lon >= -8.0 and lon <= -7.0):  # Casablanca region
+                    is_land = True
+                elif (lat >= 33.0 and lat <= 33.5 and lon >= -9.0 and lon <= -8.0):  # South of Casablanca
+                    is_land = True
+            
+            # Additional coastal points to ensure complete land masking
+            if (lat >= 32.0 and lat <= 36.0 and lon >= -10.0 and lon <= -5.0):
+                # Conservative approach - mark as land if close to known coastal cities
+                coastal_cities = [
+                    (35.78, -5.81),  # Tangier
+                    (34.02, -6.83),  # Rabat
+                    (33.57, -7.59),  # Casablanca
+                    (33.24, -8.51),  # El Jadida
+                    (37.02, -7.93),  # Faro (Portugal)
+                    (38.72, -9.14),  # Lisbon
+                    (41.15, -8.61),  # Porto
+                ]
+                for city_lat, city_lon in coastal_cities:
+                    distance = np.sqrt((lat - city_lat)**2 + (lon - city_lon)**2)
+                    if distance < 0.5:  # Within ~50km of coastal city
+                        is_land = True
+                        break
+            
+            # If it's land, mask it out (we only want ocean points)
+            if is_land:
+                ocean_mask[i, j] = False
+    
+    return ocean_mask
+
+def plot_morocco_portugal_coastline_nao_sst_correlation(sst_file, nao_djf_data, significance_level=0.05):
+    """
+    Focused plot for Morocco-Portugal coastline region (5°W to 10°W)
+    """
+    print("=== CREATING MOROCCO-PORTUGAL COASTLINE NAO-SST CORRELATION MAP ===")
+    
+    # Open SST data
+    dataset = nc.Dataset(sst_file, 'r')
+    
+    # Read dimensions
+    time_var = dataset.variables['valid_time']
+    lat_var = dataset.variables['latitude']
+    lon_var = dataset.variables['longitude']
+    sst_var = dataset.variables['sst']
+    
+    # Convert time to datetime objects
+    times = nc.num2date(time_var[:], time_var.units)
+    regular_times = []
+    for t in times:
+        if hasattr(t, 'year'):
+            regular_times.append(datetime(t.year, t.month, t.day, t.hour, t.minute, t.second))
+        else:
+            regular_times.append(t)
+    
+    # Get latitude and longitude values
+    latitudes = lat_var[:]
+    longitudes = lon_var[:]
+    
+    # Convert longitude if needed (0-360 to -180-180)
+    if longitudes.max() > 180:
+        longitudes = np.where(longitudes > 180, longitudes - 360, longitudes)
+    
+    # Focus on the specific Morocco-Portugal coastline region
+    lat_min, lat_max = 22, 42  # From Southern Morocco to Northern Portugal
+    lon_min, lon_max = -30, -5  # 30°W to 5°W
+
+    print(f"Focus region: lats {lat_min} to {lat_max}, lons {lon_min} to {lon_max}")
+
+    # Find indices for our region
+    lat_indices = np.where((latitudes >= lat_min) & (latitudes <= lat_max))[0]
+    lon_indices = np.where((longitudes >= lon_min) & (longitudes <= lon_max))[0]
+    
+    print(f"Full dataset dimensions: time={len(regular_times)}, lat={len(latitudes)}, lon={len(longitudes)}")
+    print(f"Region dimensions: {len(lat_indices)} lats, {len(lon_indices)} lons")
+    
+    # Create COMPREHENSIVE ocean mask for this specific region
+    region_lats = latitudes[lat_indices]
+    region_lons = longitudes[lon_indices]
+    ocean_mask = create_comprehensive_ocean_mask(region_lats, region_lons)
+    
+    ocean_points = np.sum(ocean_mask)
+    total_points = ocean_mask.size
+    print(f"Ocean mask: {ocean_points} ocean points out of {total_points} total ({ocean_points/total_points*100:.1f}%)")
+    
+    # Get DJF months and organize by winter season
+    djf_indices = []
+    djf_years = []
+    djf_months = []
+    
+    for i, t in enumerate(regular_times):
+        if t.month in [12, 1, 2]:
+            djf_indices.append(i)
+            djf_years.append(t.year)
+            djf_months.append(t.month)
+    
+    # Organize by winter season
+    winter_seasons = {}
+    for idx, year, month in zip(djf_indices, djf_years, djf_months):
+        if month == 12:
+            winter_year = year + 1
+        else:
+            winter_year = year
+        
+        if winter_year not in winter_seasons:
+            winter_seasons[winter_year] = {'dec': None, 'jan': None, 'feb': None}
+        
+        if month == 12:
+            winter_seasons[winter_year]['dec'] = idx
+        elif month == 1:
+            winter_seasons[winter_year]['jan'] = idx
+        elif month == 2:
+            winter_seasons[winter_year]['feb'] = idx
+    
+    # Keep only complete winter seasons
+    complete_winters = {}
+    for year, months in winter_seasons.items():
+        if months['dec'] is not None and months['jan'] is not None and months['feb'] is not None:
+            complete_winters[year] = [months['dec'], months['jan'], months['feb']]
+    
+    print(f"Complete winter seasons: {len(complete_winters)}")
+    
+    # Match with NAO DJF data years
+    nao_years = list(range(1979, 1979 + len(nao_djf_data)))
+    valid_winters = {}
+    
+    for year in nao_years:
+        if year in complete_winters:
+            valid_winters[year] = complete_winters[year]
+    
+    print(f"Winters matching NAO data: {len(valid_winters)}")
+    
+    # Load SST data for valid winters
+    n_years = len(valid_winters)
+    sst_djf = np.full((n_years, len(lat_indices), len(lon_indices)), np.nan)
+    
+    print("Loading SST data...")
+    
+    for i, (year, indices) in enumerate(sorted(valid_winters.items())):
+        winter_data = []
+        
+        for idx in indices:
+            sst_full = sst_var[idx, :, :]
+            
+            if sst_full.max() > 200:  # Convert Kelvin to Celsius
+                sst_full = sst_full - 273.15
+            
+            sst_region = sst_full[lat_indices[:, np.newaxis], lon_indices]
+            winter_data.append(sst_region)
+        
+        sst_djf[i] = np.nanmean(winter_data, axis=0)
+    
+    print(f"Loaded SST data for {n_years} winter seasons")
+    
+    # Close the netCDF file
+    dataset.close()
+    
+    # Calculate correlations ONLY over ocean points
+    corr_map = np.full((len(lat_indices), len(lon_indices)), np.nan)
+    p_value_map = np.full((len(lat_indices), len(lon_indices)), np.nan)
+    
+    print("Calculating correlations at ocean grid points only...")
+    
+    nao_subset = nao_djf_data[:n_years]
+    
+    for i in range(len(lat_indices)):
+        for j in range(len(lon_indices)):
+            # ONLY calculate for ocean points
+            if ocean_mask[i, j]:
+                sst_ts = sst_djf[:, i, j]
+                
+                valid_mask = ~np.isnan(sst_ts) & ~np.isnan(nao_subset)
+                valid_sst = sst_ts[valid_mask]
+                valid_nao = nao_subset[valid_mask]
+                
+                if len(valid_sst) > 10:
+                    try:
+                        corr, p_value = pearsonr(valid_sst, valid_nao)
+                        corr_map[i, j] = corr
+                        p_value_map[i, j] = p_value
+                    except:
+                        corr_map[i, j] = np.nan
+                        p_value_map[i, j] = np.nan
+    
+    # Create coordinate arrays
+    plot_lats = latitudes[lat_indices]
+    plot_lons = longitudes[lon_indices]
+    
+    # Create the plot
+    fig = plt.figure(figsize=(12, 10))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    
+    # Set exact extent for Morocco-Portugal coastline
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+
+    # Add detailed map features
+    ax.add_feature(cfeature.COASTLINE, linewidth=1.2, zorder=2)
+    ax.add_feature(cfeature.LAND, color='lightgray', alpha=0.8, zorder=1)
+    ax.add_feature(cfeature.OCEAN, color='white', zorder=0)
+    
+    # Define contour levels
+    levels = np.arange(-0.8, 0.81, 0.1)
+    
+    # Plot correlation contours
+    contourf = ax.contourf(plot_lons, plot_lats, corr_map, levels=levels, 
+                          cmap='RdBu_r', transform=ccrs.PlateCarree(),
+                          extend='both', zorder=0)
+    
+    # Plot contour lines
+    contours = ax.contour(plot_lons, plot_lats, corr_map, levels=levels, 
+                         colors='black', linewidths=0.5, transform=ccrs.PlateCarree(),
+                         zorder=1)
+    plt.clabel(contours, inline=True, fontsize=8, fmt='%.1f')
+    
+    # Plot significance only over ocean points
+    sig_mask = (p_value_map < significance_level) & ocean_mask
+    
+    if np.any(sig_mask):
+        # Create meshgrid
+        lon_grid, lat_grid = np.meshgrid(plot_lons, plot_lats)
+        
+        # Create binary mask for significant ocean points
+        sig_contour_data = np.where(sig_mask, 1.0, 0.0)
+        
+        # Plot significance contours ONLY where we have significant ocean points
+        sig_contours = ax.contour(lon_grid, lat_grid, sig_contour_data, levels=[0.5], 
+                                 colors='red', linewidths=2.0, transform=ccrs.PlateCarree(),
+                                 zorder=3)
+        print(f"Significant ocean regions: {np.sum(sig_mask)} points")
+    
+    # Add grid lines
+    gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.7)
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.xlocator = plt.FixedLocator([-30, -25, -20, -15, -10, -5])
+    gl.ylocator = plt.FixedLocator([22, 25, 28, 31, 34, 37, 40, 42])
+
+    # Add colorbar
+    cbar = plt.colorbar(contourf, ax=ax, orientation='horizontal', 
+                       pad=0.05, shrink=0.8, aspect=30)
+    cbar.set_label('NAO-SST Correlation Coefficient (r)', fontsize=12, fontweight='bold')
+    
+    # Add all coastal city markers for reference
+    cities = {
+        'Dakhla': (23.71, -15.93),
+        'Boujdour': (26.13, -14.48),
+        'Laayoune': (27.15, -13.20),
+        'Tan-Tan': (28.43, -11.10),
+        'Sidi Ifni': (29.38, -10.18),
+        'Agadir': (30.42, -9.58),
+        'Essaouira': (31.51, -9.77),
+        'Safi': (32.30, -9.24),
+        'Casablanca': (33.57, -7.59),
+        'Kenitra': (34.25, -6.58),
+        'Tangier': (35.78, -5.81),
+        'Lisbon': (38.72, -9.14),  # Portugal
+    }
+    
+    # Plot cities on the map
+    for city, (lat, lon) in cities.items():
+        ax.plot(lon, lat, 'ko', markersize=4, transform=ccrs.PlateCarree(), zorder=4)
+        ax.text(lon + 0.2, lat + 0.1, city, fontsize=8, 
+                transform=ccrs.PlateCarree(), zorder=4,
+                bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.7))
+    
+    # Set title
+    plt.title(f'Winter (DJF) NAO-SST Correlation: Morocco-Portugal Coastline\n' +
+             f'({n_years} seasons: {min(valid_winters.keys())}-{max(valid_winters.keys())})\n' +
+             'Region: 22°N-42°N, 30°W-5°W | Red line: p < 0.05 significance', 
+             fontsize=11, pad=20, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig('morocco_portugal_coastline_nao_sst_correlation.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Print detailed statistics
+    valid_corrs = corr_map[~np.isnan(corr_map)]
+    sig_corrs = corr_map[sig_mask & ~np.isnan(corr_map)]
+    
+    print(f"\nCorrelation Statistics for Morocco-Portugal Coastline:")
+    print(f"  Ocean points with data: {len(valid_corrs)}")
+    print(f"  Significant ocean points: {np.sum(sig_mask)}")
+    print(f"  Mean correlation: {np.nanmean(valid_corrs):.3f}")
+    print(f"  Correlation range: {np.nanmin(valid_corrs):.3f} to {np.nanmax(valid_corrs):.3f}")
+    
+    # Print correlations near major coastal cities
+    print(f"\nCorrelations near coastal cities:")
+    for city, (city_lat, city_lon) in cities.items():
+        # Find closest grid point
+        lat_idx = np.argmin(np.abs(plot_lats - city_lat))
+        lon_idx = np.argmin(np.abs(plot_lons - city_lon))
+        
+        if ocean_mask[lat_idx, lon_idx]:
+            corr_val = corr_map[lat_idx, lon_idx]
+            p_val = p_value_map[lat_idx, lon_idx]
+            sig_flag = "**" if p_val < 0.05 else ""
+            print(f"  {city}: r = {corr_val:.3f}{sig_flag} (p = {p_val:.3f})")
+        else:
+            print(f"  {city}: Land point (no SST data)")
+    
+    return corr_map, p_value_map, plot_lats, plot_lons
+
+# Run the focused Morocco-Portugal coastline version
+if __name__ == "__main__":
+    sst_file_path = "C:/Users/moham/OneDrive/Documents/Climate_Project/dadefda24611707dd32599a670df250b.nc"
+    
+    print("Loading data for Morocco-Portugal coastline correlation map...")
+    
+    # Get NAO DJF data
+    nao_monthly = calculate_nao_index_netcdf_simple(sst_file_path)
+    nao_djf = get_djf_nao_data(nao_monthly)
+    
+    # Create the focused correlation map
+    corr_map, p_map, lats, lons = plot_morocco_portugal_coastline_nao_sst_correlation(
+        sst_file_path, nao_djf)
+            
+    print("Morocco-Portugal coastline Winter NAO-SST correlation map completed!")

@@ -1,0 +1,558 @@
+import numpy as np
+import pandas as pd
+import netCDF4 as nc
+import matplotlib.pyplot as plt
+from scipy import stats
+from statsmodels.tsa.stattools import grangercausalitytests
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+def calculate_moroccan_upwelling_index(file_path, start_year=1978, end_year=2022):
+    """
+    Calculate upwelling index for Moroccan Atlantic coast using wind data.
+    """
+    print("=== CALCULATING MOROCCAN UPWELLING INDEX ===")
+    
+    # Open the NetCDF file
+    dataset = nc.Dataset(file_path, 'r')
+    
+    # Read dimensions
+    time_var = dataset.variables['valid_time']
+    lat_var = dataset.variables['latitude']
+    lon_var = dataset.variables['longitude']
+    u10_var = dataset.variables['u10']
+    v10_var = dataset.variables['v10']
+    
+    # Convert time to datetime objects
+    times = nc.num2date(time_var[:], time_var.units)
+    regular_times = []
+    for t in times:
+        if hasattr(t, 'year'):
+            regular_times.append(datetime(t.year, t.month, t.day, t.hour, t.minute, t.second))
+        else:
+            regular_times.append(t)
+    
+    # Find indices for our time period
+    start_date = datetime(start_year, 1, 1)
+    end_date = datetime(end_year, 12, 31)
+    time_mask = (np.array(regular_times) >= start_date) & (np.array(regular_times) <= end_date)
+    time_indices = np.where(time_mask)[0]
+    
+    # Get latitude and longitude values
+    latitudes = lat_var[:]
+    longitudes = lon_var[:]
+    
+    # Moroccan Atlantic coast region - using the same coordinates that worked
+    moroccan_lat_range = (20, 35)
+    moroccan_lon_range = (-12, -6)
+    
+    # Convert longitude if needed
+    if longitudes.max() > 180:
+        longitudes_converted = np.where(longitudes > 180, longitudes - 360, longitudes)
+    else:
+        longitudes_converted = longitudes.copy()
+    
+    # Select Moroccan coastal region
+    lat_mask = (latitudes >= moroccan_lat_range[0]) & (latitudes <= moroccan_lat_range[1])
+    lon_mask = (longitudes_converted >= moroccan_lon_range[0]) & (longitudes_converted <= moroccan_lon_range[1])
+    
+    lat_indices = np.where(lat_mask)[0]
+    lon_indices = np.where(lon_mask)[0]
+    
+    print(f"Moroccan region: {len(lat_indices)} lats, {len(lon_indices)} lons")
+    
+    # Read wind data
+    print("Reading wind data...")
+    u10_data = u10_var[time_indices, :, :]
+    v10_data = v10_var[time_indices, :, :]
+    
+    # Calculate upwelling index using the method that worked in verification
+    upwelling_index = calculate_upwelling_ekman_transport(u10_data, v10_data, lat_indices, lon_indices, latitudes)
+    
+    # NORMALIZE THE UPWELLING INDEX
+    print("Normalizing upwelling index...")
+    upwelling_index_normalized = (upwelling_index - np.nanmean(upwelling_index)) / np.nanstd(upwelling_index)
+    
+    print(f"Raw upwelling range: {np.nanmin(upwelling_index):.3f} to {np.nanmax(upwelling_index):.3f}")
+    print(f"Normalized upwelling range: {np.nanmin(upwelling_index_normalized):.3f} to {np.nanmax(upwelling_index_normalized):.3f}")
+    
+    # Create time series
+    upwelling_times = [regular_times[i] for i in time_indices]
+    upwelling_series = pd.Series(upwelling_index_normalized, index=upwelling_times, name='Upwelling_Index')
+    
+    # Print verification statistics
+    print(f"Upwelling index statistics:")
+    print(f"  Mean: {upwelling_series.mean():.4f}")
+    print(f"  Std:  {upwelling_series.std():.4f}")
+    print(f"  Min:  {upwelling_series.min():.4f}")
+    print(f"  Max:  {upwelling_series.max():.4f}")
+    print(f"  Non-zero values: {(upwelling_series != 0).sum()}/{len(upwelling_series)}")
+    
+    dataset.close()
+    
+    return upwelling_series
+
+def calculate_upwelling_ekman_transport(u10_data, v10_data, lat_indices, lon_indices, latitudes):
+    """
+    Calculate the Moroccan upwelling index (Ekman transport per 100 m of coastline).
+
+    Based on: Hilmi et al. (2022), 'Long-term upwelling activity along the Moroccan Atlantic coast'
+
+    Formula:
+        Mx = (ρ_air * C_d * |V| * u10) / (ρ_w * f)
+        My = (ρ_air * C_d * |V| * v10) / (ρ_w * f)
+    Ekman transport per unit coastline (m³/s per 100 m):
+        UI = (-My) * 100    # negative northward component favors upwelling
+    """
+
+    # Physical constants
+    rho_air = 1.22         # kg/m³
+    rho_water = 1025.0     # kg/m³
+    C_d = 1.3e-3           # drag coefficient
+    omega = 7.2921e-5      # Earth's rotation rate (rad/s)
+
+    n_times = u10_data.shape[0]
+    upwelling_index = np.zeros(n_times)
+
+    # Area-weighted latitude mean
+    lat_weights = np.cos(np.deg2rad(latitudes[lat_indices]))[:, np.newaxis]
+
+    for t in range(n_times):
+        # Extract wind components
+        u10_region = u10_data[t, lat_indices[:, np.newaxis], lon_indices]
+        v10_region = v10_data[t, lat_indices[:, np.newaxis], lon_indices]
+
+        # Wind speed magnitude
+        Vmag = np.sqrt(u10_region**2 + v10_region**2)
+
+        # Coriolis parameter f = 2 * omega * sin(lat)
+        f = 2 * omega * np.sin(np.deg2rad(latitudes[lat_indices]))[:, np.newaxis]
+
+        # Avoid division by zero near the equator
+        f = np.where(np.abs(f) < 1e-10, np.nan, f)
+
+        # Ekman transport components (m²/s)
+        Mx = (rho_air * C_d * Vmag * u10_region) / (rho_water * f)
+        My = (rho_air * C_d * Vmag * v10_region) / (rho_water * f)
+
+        # Upwelling index = -My * 100 (convert to m³/s per 100 m of coastline)
+        transport = -My * 100.0
+
+        # Weighted average over region
+        weighted_sum = np.nansum(transport * lat_weights)
+        weight_sum = np.nansum(lat_weights)
+
+        if weight_sum > 0 and not np.isnan(weighted_sum):
+            upwelling_index[t] = weighted_sum / weight_sum
+        else:
+            upwelling_index[t] = np.nan
+
+    return upwelling_index
+
+def calculate_moroccan_sst(file_path, start_year=1978, end_year=2022):
+    """
+    Calculate SST for Moroccan Atlantic region.
+    """
+    print("=== CALCULATING MOROCCAN SST ===")
+    
+    # Open the NetCDF file
+    dataset = nc.Dataset(file_path, 'r')
+    
+    # Read dimensions
+    time_var = dataset.variables['valid_time']
+    lat_var = dataset.variables['latitude']
+    lon_var = dataset.variables['longitude']
+    sst_var = dataset.variables['sst']
+    
+    # Convert time to datetime objects
+    times = nc.num2date(time_var[:], time_var.units)
+    regular_times = []
+    for t in times:
+        if hasattr(t, 'year'):
+            regular_times.append(datetime(t.year, t.month, t.day, t.hour, t.minute, t.second))
+        else:
+            regular_times.append(t)
+    
+    # Find indices for our time period
+    start_date = datetime(start_year, 1, 1)
+    end_date = datetime(end_year, 12, 31)
+    time_mask = (np.array(regular_times) >= start_date) & (np.array(regular_times) <= end_date)
+    time_indices = np.where(time_mask)[0]
+    
+    # Get latitude and longitude values
+    latitudes = lat_var[:]
+    longitudes = lon_var[:]
+    
+    # Moroccan Atlantic region
+    moroccan_lat_range = (20, 36)
+    moroccan_lon_range = (-17, -5)
+    
+    # Convert longitude if needed
+    if longitudes.max() > 180:
+        longitudes_converted = np.where(longitudes > 180, longitudes - 360, longitudes)
+    else:
+        longitudes_converted = longitudes.copy()
+    
+    # Select Moroccan region
+    lat_mask = (latitudes >= moroccan_lat_range[0]) & (latitudes <= moroccan_lat_range[1])
+    lon_mask = (longitudes_converted >= moroccan_lon_range[0]) & (longitudes_converted <= moroccan_lon_range[1])
+    
+    lat_indices = np.where(lat_mask)[0]
+    lon_indices = np.where(lon_mask)[0]
+    
+    print(f"Moroccan SST region: {len(lat_indices)} lats, {len(lon_indices)} lons")
+    
+    # Read SST data
+    print("Reading SST data...")
+    sst_data = sst_var[time_indices, :, :]
+    sst_data = sst_data - 273.15  # Convert to Celsius
+    
+    # Calculate area-weighted mean SST
+    sst_index = calculate_spatial_mean(sst_data, lat_indices, lon_indices, latitudes)
+    
+    # NORMALIZE THE SST INDEX
+    print("Normalizing SST index...")
+    sst_index_normalized = (sst_index - np.nanmean(sst_index)) / np.nanstd(sst_index)
+    
+    print(f"Raw SST range: {np.nanmin(sst_index):.3f} to {np.nanmax(sst_index):.3f} °C")
+    print(f"Normalized SST range: {np.nanmin(sst_index_normalized):.3f} to {np.nanmax(sst_index_normalized):.3f}")
+    
+    # Create time series
+    sst_times = [regular_times[i] for i in time_indices]
+    sst_series = pd.Series(sst_index_normalized, index=sst_times, name='SST_Moroccan')
+    
+    dataset.close()
+    
+    return sst_series
+
+def calculate_spatial_mean(data, lat_indices, lon_indices, latitudes):
+    """
+    Calculate area-weighted spatial mean.
+    """
+    n_times = data.shape[0]
+    spatial_mean = np.zeros(n_times)
+    
+    lat_weights = np.cos(np.deg2rad(latitudes[lat_indices]))[:, np.newaxis]
+    
+    for t in range(n_times):
+        region_data = data[t, lat_indices[:, np.newaxis], lon_indices]
+        
+        weighted_sum = np.nansum(region_data * lat_weights)
+        weight_sum = np.nansum(lat_weights)
+        
+        if weight_sum > 0:
+            spatial_mean[t] = weighted_sum / weight_sum
+        else:
+            spatial_mean[t] = np.nan
+    
+    return spatial_mean
+
+def prepare_seasonal_data_simple(nao_series, upwelling_series, sst_series):
+    """
+    Simple and robust seasonal data preparation.
+    """
+    print("=== PREPARING SEASONAL DATA ===")
+    
+    # Combine all series into a DataFrame
+    df = pd.DataFrame({
+        'NAO': nao_series,
+        'Upwelling': upwelling_series,
+        'SST': sst_series
+    })
+    
+    # Remove any rows with NaN values
+    df = df.dropna()
+    print(f"Total monthly data points: {len(df)}")
+    
+    # Create seasonal data directly without complex date manipulation
+    seasons_data = {}
+    
+    for season_name, months in [('DJF', [12, 1, 2]), ('MAM', [3, 4, 5]), 
+                               ('JJA', [6, 7, 8]), ('SON', [9, 10, 11])]:
+        
+        seasonal_data = []
+        
+        for year in sorted(df.index.year.unique()):
+            if season_name == 'DJF':
+                if year == df.index.year.min():
+                    continue
+                # DJF: Dec (prev year) + Jan, Feb (current year)
+                dec_data = df[(df.index.month == 12) & (df.index.year == year-1)]
+                jan_feb_data = df[(df.index.month.isin([1, 2])) & (df.index.year == year)]
+                season_data = pd.concat([dec_data, jan_feb_data])
+            else:
+                # Other seasons within same year
+                season_data = df[(df.index.month.isin(months)) & (df.index.year == year)]
+            
+            if len(season_data) == 3:  # All 3 months available
+                seasonal_mean = season_data.mean()
+                seasonal_data.append(seasonal_mean)
+        
+        if seasonal_data:
+            # Create simple seasonal DataFrame with year as index
+            seasonal_df = pd.DataFrame(seasonal_data)
+            # Use year as index (much simpler)
+            years = []
+            for i, _ in enumerate(seasonal_data):
+                if season_name == 'DJF':
+                    years.append(df.index.year.min() + i)
+                else:
+                    years.append(df.index.year.min() + i)
+            
+            seasonal_df.index = years
+            seasonal_df.index.name = 'Year'
+            seasons_data[season_name] = seasonal_df
+            print(f"{season_name}: {len(seasonal_df)} seasonal values")
+    
+    return seasons_data
+
+def perform_granger_causality(seasons_data, max_lag=2):
+    """
+    Perform Granger causality tests for all variable pairs and seasons.
+    """
+    print("\n=== GRANGER CAUSALITY ANALYSIS ===")
+    
+    results = {}
+    
+    for season, data in seasons_data.items():
+        print(f"\n--- {season} Season ---")
+        season_results = {}
+        
+        # Test all variable pairs
+        variables = ['NAO', 'Upwelling', 'SST']
+        
+        for cause_var in variables:
+            for effect_var in variables:
+                if cause_var != effect_var:
+                    test_name = f"{cause_var} -> {effect_var}"
+                    print(f"Testing: {test_name}")
+                    
+                    try:
+                        # Prepare data for Granger test
+                        test_data = data[[cause_var, effect_var]].dropna()
+                        
+                        if len(test_data) > max_lag * 3:
+                            # Perform Granger causality test
+                            gc_result = grangercausalitytests(test_data, maxlag=max_lag, verbose=False)
+                            
+                            # Store p-values for each lag
+                            p_values = {}
+                            for lag in range(1, max_lag + 1):
+                                p_value = gc_result[lag][0]['ssr_ftest'][1]
+                                p_values[lag] = p_value
+                            
+                            season_results[test_name] = p_values
+                            
+                            # Print significant results
+                            significant_lags = [lag for lag, p in p_values.items() if p < 0.05]
+                            if significant_lags:
+                                print(f"  ✓ Significant at lags: {significant_lags} (p-values: {[p_values[lag] for lag in significant_lags]})")
+                            else:
+                                min_p = min(p_values.values())
+                                print(f"  ✗ Not significant (min p-value: {min_p:.3f})")
+                                
+                        else:
+                            print(f"  ⚠ Insufficient data")
+                            
+                    except Exception as e:
+                        print(f"  ✗ Error: {e}")
+        
+        results[season] = season_results
+    
+    return results
+
+def plot_seasonal_comparison_three_axes(seasons_data):
+    """
+    Plot seasonal comparison of all three variables with THREE separate vertical axes.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
+    
+    seasons = ['DJF', 'MAM', 'JJA', 'SON']
+    
+    # Colors for each variable
+    colors = {
+        'NAO': 'blue',
+        'Upwelling': 'green', 
+        'SST': 'red'
+    }
+    
+    for i, season in enumerate(seasons):
+        if season in seasons_data:
+            data = seasons_data[season]
+            
+            # Create three separate y-axes
+            ax1 = axes[i]  # Primary axis (NAO)
+            ax2 = ax1.twinx()  # Secondary axis (Upwelling)
+            ax3 = ax1.twinx()  # Tertiary axis (SST)
+            
+            # Position the third axis
+            ax3.spines['right'].set_position(('outward', 60))
+            
+            # Plot NAO on left axis (blue)
+            l1 = ax1.plot(data.index, data['NAO'], color=colors['NAO'], 
+                         label='NAO', linewidth=2, marker='o', markersize=3)
+            ax1.set_ylabel('NAO Index', color=colors['NAO'], fontsize=10)
+            ax1.tick_params(axis='y', labelcolor=colors['NAO'])
+            
+            # Plot Upwelling on middle axis (green)
+            l2 = ax2.plot(data.index, data['Upwelling'], color=colors['Upwelling'], 
+                         label='Upwelling', linewidth=2, marker='s', markersize=3)
+            ax2.set_ylabel('Upwelling Index', color=colors['Upwelling'], fontsize=10)
+            ax2.tick_params(axis='y', labelcolor=colors['Upwelling'])
+            
+            # Plot SST on right axis (red)
+            l3 = ax3.plot(data.index, data['SST'], color=colors['SST'], 
+                         label='SST', linewidth=2, marker='^', markersize=3)
+            ax3.set_ylabel('SST Index', color=colors['SST'], fontsize=10)
+            ax3.tick_params(axis='y', labelcolor=colors['SST'])
+            
+            ax1.set_xlabel('Year')
+            ax1.set_title(f'{season} Season - Moroccan Atlantic Region\n(All indices normalized)', fontsize=12)
+            ax1.grid(True, alpha=0.3)
+            
+            # Combine legends from all three axes
+            lines = l1 + l2 + l3
+            labels = [l.get_label() for l in lines]
+            ax1.legend(lines, labels, loc='upper left', fontsize=9)
+            
+            # Add horizontal zero lines
+            ax1.axhline(y=0, color=colors['NAO'], linestyle='--', alpha=0.5)
+            ax2.axhline(y=0, color=colors['Upwelling'], linestyle='--', alpha=0.5)
+            ax3.axhline(y=0, color=colors['SST'], linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    plt.savefig('seasonal_comparison_three_axes.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_correlation_heatmap(seasons_data):
+    """
+    Plot correlation heatmaps for each season with proper spacing.
+    """
+    # Create figure with more vertical space between subplots
+    fig, axes = plt.subplots(2, 2, figsize=(12, 12))  # Increased height from 10 to 12
+    axes = axes.flatten()
+    
+    seasons = ['DJF', 'MAM', 'JJA', 'SON']
+    
+    for i, season in enumerate(seasons):
+        if season in seasons_data:
+            data = seasons_data[season]
+            
+            # Calculate correlation matrix
+            corr_matrix = data[['NAO', 'Upwelling', 'SST']].corr()
+            
+            # Plot heatmap
+            im = axes[i].imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+            axes[i].set_xticks([0, 1, 2])
+            axes[i].set_yticks([0, 1, 2])
+            axes[i].set_xticklabels(['NAO', 'Upwelling', 'SST'], fontsize=10)
+            axes[i].set_yticklabels(['NAO', 'Upwelling', 'SST'], fontsize=10)
+            axes[i].set_title(f'{season} Season Correlations', fontsize=12, fontweight='bold', pad=15)
+            
+            # Add correlation values as text
+            for j in range(3):
+                for k in range(3):
+                    color = 'white' if abs(corr_matrix.iloc[j, k]) > 0.5 else 'black'
+                    text = axes[i].text(k, j, f'{corr_matrix.iloc[j, k]:.2f}',
+                                       ha="center", va="center", color=color, 
+                                       fontweight='bold', fontsize=11)
+    
+    # Add more space between subplots
+    plt.tight_layout(pad=3.0, h_pad=4.0, w_pad=3.0)  # Increased h_pad from default
+    
+    # Add a single colorbar for all subplots
+    fig.subplots_adjust(right=0.85)
+    cbar_ax = fig.add_axes([0.88, 0.15, 0.02, 0.7])  # Position the colorbar
+    cbar = fig.colorbar(im, cax=cbar_ax)
+    cbar.set_label('Correlation Coefficient', fontsize=12)
+    
+    plt.savefig('correlation_heatmap_seasons.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def print_granger_summary(granger_results):
+    """
+    Print summary of Granger causality results.
+    """
+    print("\n" + "="*60)
+    print("GRANGER CAUSALITY SUMMARY (p < 0.05)")
+    print("="*60)
+    
+    for season, results in granger_results.items():
+        print(f"\n{season} Season:")
+        significant_found = False
+        
+        for test_name, p_values in results.items():
+            significant_lags = [f"lag{lag}" for lag, p in p_values.items() if p < 0.05]
+            if significant_lags:
+                p_vals = [f"{p_values[lag]:.3f}" for lag in range(1, len(p_values)+1) if p_values[lag] < 0.05]
+                print(f"  {test_name}: {', '.join(significant_lags)} (p={', '.join(p_vals)})")
+                significant_found = True
+        
+        if not significant_found:
+            print("  No significant causal relationships found")
+    
+    print("\n" + "="*60)
+
+def print_seasonal_statistics(seasons_data):
+    """
+    Print basic statistics for each season.
+    """
+    print("\n" + "="*60)
+    print("SEASONAL STATISTICS (All indices normalized)")
+    print("="*60)
+    
+    for season, data in seasons_data.items():
+        print(f"\n{season} Season:")
+        print(f"  Period: {data.index.min()} to {data.index.max()}")
+        print(f"  NAO: mean={data['NAO'].mean():.3f}, std={data['NAO'].std():.3f}")
+        print(f"  Upwelling: mean={data['Upwelling'].mean():.3f}, std={data['Upwelling'].std():.3f}")
+        print(f"  SST: mean={data['SST'].mean():.3f}, std={data['SST'].std():.3f}")
+
+# Main execution
+if __name__ == "__main__":
+    file_path = "C:/Users/moham/OneDrive/Documents/Climate_Project/dadefda24611707dd32599a670df250b.nc"
+    
+    try:
+        # 1. Calculate all three time series
+        print("Loading NAO index...")
+        # Use your existing NAO calculation function (already normalized)
+        nao_monthly, _ = calculate_nao_index_netcdf(file_path)
+        
+        print("\n" + "="*60)
+        upwelling_series = calculate_moroccan_upwelling_index(file_path)
+        
+        print("\n" + "="*60)
+        sst_series = calculate_moroccan_sst(file_path)
+        
+        # 2. Prepare seasonal data
+        print("\n" + "="*60)
+        seasons_data = prepare_seasonal_data_simple(nao_monthly, upwelling_series, sst_series)
+        
+        # 3. Print seasonal statistics
+        print_seasonal_statistics(seasons_data)
+        
+        # 4. Perform Granger causality tests
+        granger_results = perform_granger_causality(seasons_data, max_lag=2)
+        
+        # 5. Print summary and plot results
+        print_granger_summary(granger_results)
+        
+        # 6. Plot seasonal comparison with THREE axes
+        plot_seasonal_comparison_three_axes(seasons_data)
+        
+        # 7. Plot correlation heatmaps
+        plot_correlation_heatmap(seasons_data)
+        
+        # 8. Save seasonal data
+        for season, data in seasons_data.items():
+            data.to_csv(f"moroccan_seasonal_{season}.csv")
+            print(f"Saved {season} data to moroccan_seasonal_{season}.csv")
+        
+        print("\n=== ANALYSIS COMPLETE ===")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()

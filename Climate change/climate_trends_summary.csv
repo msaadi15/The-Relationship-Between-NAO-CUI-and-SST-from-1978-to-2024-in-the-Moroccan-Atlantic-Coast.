@@ -1,0 +1,5 @@
+Season,Period,NAO_trend,NAO_signif,Upwelling_trend,Upwelling_signif,SST_trend,SST_signif
+DJF,1979-2022,+0.0813,,+0.0918,,+0.0642,*
+MAM,1978-2022,+0.0064,,-0.0400,,+0.0683,*
+JJA,1978-2022,-0.0419,,-0.0635,*,+0.0774,*
+SON,1978-2022,+0.0398,,-0.0051,,+0.0846,*

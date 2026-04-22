@@ -1,0 +1,948 @@
+    import numpy as np
+    import pandas as pd
+    import netCDF4 as nc
+    import matplotlib.pyplot as plt
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    from scipy.stats import f as f_dist
+    from datetime import datetime
+    import warnings
+    warnings.filterwarnings('ignore')
+
+    def calculate_nao_index_netcdf_memory_efficient(file_path, start_year=1978, end_year=2022):
+        """
+        Memory-efficient NAO calculation that processes data in chunks
+        """
+        print("=== CALCULATING NAO INDEX (MEMORY EFFICIENT) ===")
+        
+        dataset = nc.Dataset(file_path, 'r')
+        
+        # Read dimensions
+        time_var = dataset.variables['valid_time']
+        lat_var = dataset.variables['latitude']
+        lon_var = dataset.variables['longitude']
+        mslp_var = dataset.variables['msl']
+        
+        # Convert time to datetime objects
+        times = nc.num2date(time_var[:], time_var.units)
+        regular_times = []
+        for t in times:
+            if hasattr(t, 'year'):
+                regular_times.append(datetime(t.year, t.month, t.day, t.hour, t.minute, t.second))
+            else:
+                regular_times.append(t)
+        
+        # Find indices for our time period
+        start_date = datetime(start_year, 1, 1)
+        end_date = datetime(end_year, 12, 31)
+        time_mask = (np.array(regular_times) >= start_date) & (np.array(regular_times) <= end_date)
+        time_indices = np.where(time_mask)[0]
+        
+        print(f"Processing {len(time_indices)} time steps")
+        
+        # Get coordinates
+        latitudes = lat_var[:]
+        longitudes = lon_var[:]
+        
+        # Convert longitude if needed
+        if longitudes.max() > 180:
+            longitudes_converted = np.where(longitudes > 180, longitudes - 360, longitudes)
+        else:
+            longitudes_converted = longitudes.copy()
+        
+        # Define regions
+        azores_lat_mask = (latitudes <= 45) & (latitudes >= 35)
+        azores_lon_mask = (longitudes_converted >= -45) & (longitudes_converted <= -25)
+        iceland_lat_mask = (latitudes <= 70) & (latitudes >= 55)
+        iceland_lon_mask = (longitudes_converted >= -45) & (longitudes_converted <= -25)
+        
+        azores_lat_indices = np.where(azores_lat_mask)[0]
+        azores_lon_indices = np.where(azores_lon_mask)[0]
+        iceland_lat_indices = np.where(iceland_lat_mask)[0]
+        iceland_lon_indices = np.where(iceland_lon_mask)[0]
+        
+        # Calculate monthly climatology in chunks
+        print("Calculating monthly climatology...")
+        monthly_clim = np.zeros((12, len(latitudes), len(longitudes)))
+        monthly_counts = np.zeros(12)
+        
+        # Process in smaller chunks to save memory
+        chunk_size = 12  # Process one year at a time
+        for chunk_start in range(0, len(time_indices), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(time_indices))
+            chunk_indices = time_indices[chunk_start:chunk_end]
+            
+            # Load only the chunk we need
+            mslp_chunk = mslp_var[chunk_indices, :, :] / 100  # Convert Pa to hPa
+            
+            for idx, time_idx in enumerate(chunk_indices):
+                t = regular_times[time_idx]
+                month = t.month - 1
+                
+                monthly_clim[month, :, :] += mslp_chunk[idx, :, :]
+                monthly_counts[month] += 1
+        
+        # Average the climatology
+        for month in range(12):
+            if monthly_counts[month] > 0:
+                monthly_clim[month, :, :] /= monthly_counts[month]
+        
+        # Calculate NAO index in chunks
+        print("Calculating NAO index...")
+        nao_index = np.zeros(len(time_indices))
+        lat_weights = np.cos(np.deg2rad(latitudes))
+        
+        for chunk_start in range(0, len(time_indices), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(time_indices))
+            chunk_indices = time_indices[chunk_start:chunk_end]
+            
+            # Load only the chunk we need
+            mslp_chunk = mslp_var[chunk_indices, :, :] / 100  # Convert Pa to hPa
+            
+            for idx, time_idx in enumerate(chunk_indices):
+                t = regular_times[time_idx]
+                month = t.month - 1
+                
+                # Calculate anomaly for this time step
+                mslp_anom = mslp_chunk[idx, :, :] - monthly_clim[month, :, :]
+                
+                # Azores region
+                azores_region = mslp_anom[azores_lat_indices[:, np.newaxis], azores_lon_indices]
+                azores_weights = lat_weights[azores_lat_indices][:, np.newaxis]
+                weighted_sum = np.nansum(azores_region * azores_weights)
+                weight_sum = np.nansum(azores_weights)
+                azores_mean = weighted_sum / weight_sum if weight_sum > 0 else np.nan
+                
+                # Iceland region
+                iceland_region = mslp_anom[iceland_lat_indices[:, np.newaxis], iceland_lon_indices]
+                iceland_weights = lat_weights[iceland_lat_indices][:, np.newaxis]
+                weighted_sum = np.nansum(iceland_region * iceland_weights)
+                weight_sum = np.nansum(iceland_weights)
+                iceland_mean = weighted_sum / weight_sum if weight_sum > 0 else np.nan
+                
+                if not np.isnan(azores_mean) and not np.isnan(iceland_mean):
+                    nao_index[chunk_start + idx] = azores_mean - iceland_mean
+                else:
+                    nao_index[chunk_start + idx] = np.nan
+        
+        # Normalize
+        nao_index_normalized = (nao_index - np.nanmean(nao_index)) / np.nanstd(nao_index)
+        
+        # Create time series
+        nao_times = [regular_times[i] for i in time_indices]
+        nao_series = pd.Series(nao_index_normalized, index=nao_times, name='NAO_Index')
+        nao_series = nao_series.dropna()
+        
+        dataset.close()
+        
+        print(f"NAO index calculated: {len(nao_series)} values")
+        return nao_series
+
+    def calculate_moroccan_sst_memory_efficient(file_path, start_year=1978, end_year=2022):
+        """
+        Memory-efficient SST calculation for Moroccan region
+        """
+        print("=== CALCULATING MOROCCAN SST (MEMORY EFFICIENT) ===")
+        
+        dataset = nc.Dataset(file_path, 'r')
+        
+        time_var = dataset.variables['valid_time']
+        lat_var = dataset.variables['latitude']
+        lon_var = dataset.variables['longitude']
+        sst_var = dataset.variables['sst']
+        
+        # Convert time to datetime objects
+        times = nc.num2date(time_var[:], time_var.units)
+        regular_times = []
+        for t in times:
+            if hasattr(t, 'year'):
+                regular_times.append(datetime(t.year, t.month, t.day, t.hour, t.minute, t.second))
+            else:
+                regular_times.append(t)
+        
+        # Find indices for our time period
+        start_date = datetime(start_year, 1, 1)
+        end_date = datetime(end_year, 12, 31)
+        time_mask = (np.array(regular_times) >= start_date) & (np.array(regular_times) <= end_date)
+        time_indices = np.where(time_mask)[0]
+        
+        print(f"Processing {len(time_indices)} time steps")
+        
+        # Get coordinates
+        latitudes = lat_var[:]
+        longitudes = lon_var[:]
+        
+        # Moroccan Atlantic region
+        moroccan_lat_range = (20, 42)
+        moroccan_lon_range = (-30, -5)
+        
+        # Convert longitude if needed
+        if longitudes.max() > 180:
+            longitudes_converted = np.where(longitudes > 180, longitudes - 360, longitudes)
+        else:
+            longitudes_converted = longitudes.copy()
+        
+        # Select Moroccan region
+        lat_mask = (latitudes >= moroccan_lat_range[0]) & (latitudes <= moroccan_lat_range[1])
+        lon_mask = (longitudes_converted >= moroccan_lon_range[0]) & (longitudes_converted <= moroccan_lon_range[1])
+        
+        lat_indices = np.where(lat_mask)[0]
+        lon_indices = np.where(lon_mask)[0]
+        
+        print(f"Moroccan SST region: {len(lat_indices)} lats, {len(lon_indices)} lons")
+        
+        # Calculate SST index in chunks
+        chunk_size = 12
+        sst_index = np.zeros(len(time_indices))
+        lat_weights = np.cos(np.deg2rad(latitudes[lat_indices]))[:, np.newaxis]
+        
+        print("Calculating SST index...")
+        
+        for chunk_start in range(0, len(time_indices), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(time_indices))
+            chunk_indices = time_indices[chunk_start:chunk_end]
+            
+            # Load only the chunk we need
+            sst_chunk = sst_var[chunk_indices, :, :]
+            
+            for idx, time_idx in enumerate(chunk_indices):
+                # Extract SST for Moroccan region only
+                sst_region = sst_chunk[idx, lat_indices[:, np.newaxis], lon_indices]
+                
+                # Convert Kelvin to Celsius if needed
+                if sst_region.max() > 200:
+                    sst_region = sst_region - 273.15
+                
+                # Weighted average over region
+                weighted_sum = np.nansum(sst_region * lat_weights)
+                weight_sum = np.nansum(lat_weights)
+                
+                if weight_sum > 0:
+                    sst_index[chunk_start + idx] = weighted_sum / weight_sum
+                else:
+                    sst_index[chunk_start + idx] = np.nan
+        
+        # Normalize
+        sst_index_normalized = (sst_index - np.nanmean(sst_index)) / np.nanstd(sst_index)
+        
+        # Create time series
+        sst_times = [regular_times[i] for i in time_indices]
+        sst_series = pd.Series(sst_index_normalized, index=sst_times, name='SST_Moroccan')
+        
+        dataset.close()
+        
+        print(f"SST index calculated: {len(sst_series)} values")
+        return sst_series
+
+    def create_comprehensive_ocean_mask(latitudes, longitudes):
+        """Create ocean mask for Morocco-Portugal coastline region"""
+        ocean_mask = np.ones((len(latitudes), len(longitudes)), dtype=bool)
+        
+        for i in range(len(latitudes)):
+            for j in range(len(longitudes)):
+                lat = latitudes[i]
+                lon = longitudes[j]
+                
+                is_land = False
+                
+                # Portugal coastline
+                if (lat >= 36.5 and lat <= 42.0 and lon >= -9.5 and lon <= -6.0):
+                    if (lat >= 37.0 and lat <= 38.5 and lon >= -9.0 and lon <= -8.0):
+                        is_land = True
+                    elif (lat >= 38.5 and lat <= 41.5 and lon >= -9.0 and lon <= -6.0):
+                        is_land = True
+                    elif (lat >= 36.5 and lat <= 37.5 and lon >= -8.5 and lon <= -7.5):
+                        is_land = True
+                
+                # Southern Spain coastline near Gibraltar
+                if (lat >= 35.5 and lat <= 36.5 and lon >= -5.8 and lon <= -5.0):
+                    is_land = True
+                
+                # Morocco coastline
+                if (lat >= 33.0 and lat <= 36.0 and lon >= -10.0 and lon <= -5.0):
+                    if (lat >= 35.5 and lat <= 36.0 and lon >= -6.0 and lon <= -5.0):
+                        is_land = True
+                    elif (lat >= 34.0 and lat <= 35.0 and lon >= -7.0 and lon <= -6.0):
+                        is_land = True
+                    elif (lat >= 33.5 and lat <= 34.0 and lon >= -8.0 and lon <= -7.0):
+                        is_land = True
+                    elif (lat >= 33.0 and lat <= 33.5 and lon >= -9.0 and lon <= -8.0):
+                        is_land = True
+                
+                # Additional coastal points
+                if (lat >= 32.0 and lat <= 36.0 and lon >= -10.0 and lon <= -5.0):
+                    coastal_cities = [
+                        (35.78, -5.81), (34.02, -6.83), (33.57, -7.59),
+                        (33.24, -8.51), (37.02, -7.93), (38.72, -9.14),
+                        (41.15, -8.61),
+                    ]
+                    for city_lat, city_lon in coastal_cities:
+                        distance = np.sqrt((lat - city_lat)**2 + (lon - city_lon)**2)
+                        if distance < 0.5:
+                            is_land = True
+                            break
+                
+                if is_land:
+                    ocean_mask[i, j] = False
+        
+        return ocean_mask
+
+    def calculate_granger_with_specific_lags_ultra_sensitive(data_x, data_y, specific_lags, min_effect_size=0.0001):
+        """ULTRA-SENSITIVE Granger causality calculation for weak signals"""
+        if len(data_x) != len(data_y) or len(data_x) <= max(specific_lags):
+            return np.nan, np.nan, np.nan, np.nan
+        
+        valid_mask = ~np.isnan(data_x) & ~np.isnan(data_y)
+        x_clean = data_x[valid_mask]
+        y_clean = data_y[valid_mask]
+        
+        if len(x_clean) <= max(specific_lags) * 2:
+            return np.nan, np.nan, np.nan, np.nan
+        
+        try:
+            n = len(y_clean)
+            best_f_stat = 0
+            best_p_value = 1
+            best_r2_diff = 0
+            best_lag = 0
+            
+            for lag in specific_lags:
+                if n <= lag * 2:
+                    continue
+                    
+                # Create lagged matrices
+                y_lagged = np.zeros((n - lag, lag))
+                x_lagged = np.zeros((n - lag, lag))
+                
+                for i in range(lag):
+                    y_lagged[:, i] = y_clean[i:n - lag + i]
+                    x_lagged[:, i] = x_clean[i:n - lag + i]
+                
+                y_current = y_clean[lag:]
+                
+                # Remove any rows with NaNs
+                valid_rows = ~(np.any(np.isnan(y_lagged), axis=1) | 
+                            np.any(np.isnan(x_lagged), axis=1) | 
+                            np.isnan(y_current))
+                
+                if np.sum(valid_rows) < lag * 2:
+                    continue
+                    
+                y_lagged_clean = y_lagged[valid_rows]
+                x_lagged_clean = x_lagged[valid_rows]
+                y_current_clean = y_current[valid_rows]
+                
+                # Unrestricted model
+                X_unrestricted = np.column_stack([np.ones(len(y_lagged_clean)), 
+                                                y_lagged_clean, x_lagged_clean])
+                
+                # Restricted model  
+                X_restricted = np.column_stack([np.ones(len(y_lagged_clean)), y_lagged_clean])
+                
+                try:
+                    beta_unrestricted = np.linalg.lstsq(X_unrestricted, y_current_clean, rcond=None)[0]
+                    beta_restricted = np.linalg.lstsq(X_restricted, y_current_clean, rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    continue
+                
+                # Calculate predictions
+                y_pred_unrestricted = X_unrestricted @ beta_unrestricted
+                y_pred_restricted = X_restricted @ beta_restricted
+                
+                # Calculate residual sum of squares (RSS)
+                RSS_unrestricted = np.sum((y_current_clean - y_pred_unrestricted) ** 2)
+                RSS_restricted = np.sum((y_current_clean - y_pred_restricted) ** 2)
+                
+                # Total sum of squares
+                TSS = np.sum((y_current_clean - np.mean(y_current_clean)) ** 2)
+                
+                if TSS == 0 or RSS_unrestricted == 0:
+                    continue
+                    
+                # Calculate R² difference (ΔR²)
+                R2_diff = (RSS_restricted - RSS_unrestricted) / TSS
+                
+                # Parameters for F-test
+                T = len(y_current_clean)
+                K_unrestricted = X_unrestricted.shape[1]
+                K_restricted = X_restricted.shape[1]
+                
+                # Degrees of freedom
+                df_numerator = K_unrestricted - K_restricted
+                df_denominator = T - K_unrestricted
+                
+                if df_denominator <= 0:
+                    continue
+                
+                # F-statistic
+                F_stat = ((RSS_restricted - RSS_unrestricted) / df_numerator) / (RSS_unrestricted / df_denominator)
+                
+                # P-value from F-distribution
+                p_value = 1 - f_dist.cdf(F_stat, df_numerator, df_denominator)
+                
+                # ULTRA-LENIENT effect size requirement
+                if R2_diff < min_effect_size:
+                    continue
+                    
+                if p_value < best_p_value and not np.isnan(F_stat):
+                    best_f_stat = F_stat
+                    best_p_value = p_value
+                    best_r2_diff = R2_diff
+                    best_lag = lag
+            
+            return best_f_stat, best_p_value, best_r2_diff, best_lag
+        
+        except Exception as e:
+            return np.nan, np.nan, np.nan, np.nan
+
+    def prepare_seasonal_data(nao_series, sst_series):
+        """
+        Prepare seasonal data for analysis
+        """
+        print("=== PREPARING SEASONAL DATA ===")
+        
+        # Combine series into DataFrame
+        df = pd.DataFrame({
+            'NAO': nao_series,
+            'SST': sst_series
+        })
+        
+        # Remove any rows with NaN values
+        df = df.dropna()
+        print(f"Total monthly data points: {len(df)}")
+        
+        # Create seasonal data
+        seasons_data = {}
+        
+        for season_name, months in [('DJF', [12, 1, 2]), ('MAM', [3, 4, 5]), 
+                                ('JJA', [6, 7, 8]), ('SON', [9, 10, 11])]:
+            
+            seasonal_data = []
+            
+            for year in sorted(df.index.year.unique()):
+                if season_name == 'DJF':
+                    if year == df.index.year.min():
+                        continue
+                    # DJF: Dec (prev year) + Jan, Feb (current year)
+                    dec_data = df[(df.index.month == 12) & (df.index.year == year-1)]
+                    jan_feb_data = df[(df.index.month.isin([1, 2])) & (df.index.year == year)]
+                    season_data = pd.concat([dec_data, jan_feb_data])
+                else:
+                    # Other seasons within same year
+                    season_data = df[(df.index.month.isin(months)) & (df.index.year == year)]
+                
+                if len(season_data) == 3:  # All 3 months available
+                    seasonal_mean = season_data.mean()
+                    seasonal_data.append(seasonal_mean)
+            
+            if seasonal_data:
+                seasonal_df = pd.DataFrame(seasonal_data)
+                years = []
+                for i, _ in enumerate(seasonal_data):
+                    if season_name == 'DJF':
+                        years.append(df.index.year.min() + i)
+                    else:
+                        years.append(df.index.year.min() + i)
+                
+                seasonal_df.index = years
+                seasonal_df.index.name = 'Year'
+                seasons_data[season_name] = seasonal_df
+                print(f"{season_name}: {len(seasonal_df)} seasonal values")
+        
+        return seasons_data
+
+    def perform_seasonal_granger_analysis(seasons_data):
+        """
+        Perform seasonal Granger causality analysis with ALL 12 MONTHLY LAGS
+        """
+        print("\n=== SEASONAL GRANGER CAUSALITY ANALYSIS (12 MONTHLY LAGS) ===")
+        
+        results = {}
+        
+        for season, data in seasons_data.items():
+            print(f"\n--- {season} Season ---")
+            season_results = {}
+            
+            # Test both directions
+            for cause_var, effect_var in [('SST', 'NAO'), ('NAO', 'SST')]:
+                test_name = f"{cause_var} -> {effect_var}"
+                print(f"Testing: {test_name}")
+                
+                try:
+                    test_data = data[[cause_var, effect_var]].dropna()
+                    
+                    if len(test_data) > 24:  # Need more data for 12 lags
+                        # Test ALL 12 monthly lags
+                        f_stat, p_value, r2_diff, best_lag = calculate_granger_with_specific_lags_ultra_sensitive(
+                            test_data[cause_var].values, 
+                            test_data[effect_var].values, 
+                            list(range(1, 13)),  # Test lags 1-12 months
+                            0.0001      # Ultra-lenient effect size
+                        )
+                        
+                        if not np.isnan(p_value):
+                            season_results[test_name] = {
+                                'f_stat': f_stat,
+                                'p_value': p_value,
+                                'r2_diff': r2_diff,
+                                'lag': best_lag
+                            }
+                            
+                            if p_value < 0.1:
+                                print(f"  ✓ Significant at lag {best_lag} months (p={p_value:.3f}, ΔR²={r2_diff:.4f})")
+                            else:
+                                print(f"  ✗ Not significant (best lag: {best_lag}, p={p_value:.3f})")
+                        else:
+                            print(f"  ⚠ No valid result")
+                            
+                    else:
+                        print(f"  ⚠ Insufficient data for 12-lag analysis")
+                        
+                except Exception as e:
+                    print(f"  ✗ Error: {e}")
+            
+            results[season] = season_results
+        
+        return results
+
+    def perform_monthly_grid_analysis(nao_monthly, sst_monthly_grid, region_lats, region_lons, ocean_mask):
+        """
+        Perform grid-point analysis with ALL 12 MONTHLY LAGS
+        """
+        print("\n=== PERFORMING MONTHLY GRID-POINT ANALYSIS (12 MONTHLY LAGS) ===")
+        
+        # Align the data
+        min_length = min(len(nao_monthly), sst_monthly_grid.shape[0])
+        nao_aligned = nao_monthly.values[:min_length]
+        sst_aligned = sst_monthly_grid[:min_length, :, :]
+        
+        # Perform grid-point analysis with ALL 12 MONTHLY LAGS
+        f_stat_maps = {}
+        p_value_maps = {}
+        lag_maps = {}
+        r2_maps = {}
+        
+        for season_name, month_mask in [('ALL', slice(None))]:  # Use all months for monthly analysis
+            print(f"Analyzing ALL months grid points with 12 monthly lags...")
+            
+            f_stat_map = np.full((len(region_lats), len(region_lons)), np.nan)
+            p_value_map = np.full((len(region_lats), len(region_lons)), np.nan)
+            lag_map = np.full((len(region_lats), len(region_lons)), np.nan)
+            r2_map = np.full((len(region_lats), len(region_lons)), np.nan)
+            
+            valid_points = 0
+            significant_points = 0
+            
+            for i in range(len(region_lats)):
+                for j in range(len(region_lons)):
+                    if ocean_mask[i, j] and not np.all(np.isnan(sst_aligned[:, i, j])):
+                        sst_grid = sst_aligned[:, i, j]
+                        
+                        # Remove NaNs
+                        valid_mask = ~np.isnan(sst_grid) & ~np.isnan(nao_aligned)
+                        sst_clean = sst_grid[valid_mask]
+                        nao_clean = nao_aligned[valid_mask]
+                        
+                        if len(sst_clean) >= 24:  # Minimum data points for 12-lag analysis
+                            # Test ALL 12 monthly lags and take the best result
+                            best_f_stat = 0
+                            best_p_value = 1
+                            best_r2_diff = 0
+                            best_lag = 0
+                            
+                            for lag in range(1, 13):  # Test lags 1-12 months
+                                f_stat, p_value, r2_diff, _ = calculate_granger_with_specific_lags_ultra_sensitive(
+                                    sst_clean, nao_clean, [lag], 0.0001
+                                )
+                                
+                                if not np.isnan(p_value) and p_value < best_p_value:
+                                    best_f_stat = f_stat
+                                    best_p_value = p_value
+                                    best_r2_diff = r2_diff
+                                    best_lag = lag
+                            
+                            # Only store if we found a valid result
+                            if best_p_value < 1:  # Meaning we found at least one valid result
+                                f_stat_map[i, j] = best_f_stat
+                                p_value_map[i, j] = best_p_value
+                                lag_map[i, j] = best_lag
+                                r2_map[i, j] = best_r2_diff
+                                valid_points += 1
+                                if best_p_value < 0.1:
+                                    significant_points += 1
+                
+                # Progress update
+                if (i + 1) % 10 == 0:
+                    print(f"  Processed {i + 1}/{len(region_lats)} latitudes")
+            
+            f_stat_maps[season_name] = f_stat_map
+            p_value_maps[season_name] = p_value_map
+            lag_maps[season_name] = lag_map
+            r2_maps[season_name] = r2_map
+            
+            # Print detailed results by lag
+            print(f"  ALL MONTHS: {significant_points}/{valid_points} significant points ({significant_points/valid_points*100:.1f}%)")
+            
+            # Count significant points by lag
+            if significant_points > 0:
+                lag_counts = {}
+                for lag in range(1, 13):
+                    lag_count = np.sum((p_value_map < 0.1) & (lag_map == lag) & ocean_mask)
+                    if lag_count > 0:
+                        lag_counts[lag] = lag_count
+                
+                # Sort by count and show top lags
+                sorted_lags = sorted(lag_counts.items(), key=lambda x: x[1], reverse=True)
+                print("  Top optimal lags:")
+                for lag, count in sorted_lags[:6]:  # Show top 6 lags
+                    lag_percent = (count / significant_points) * 100
+                    print(f"    Lag {lag} months: {count} points ({lag_percent:.1f}%)")
+        
+        return f_stat_maps, p_value_maps, lag_maps, r2_maps
+
+    def add_map_features(ax):
+        """Add common map features"""
+        ax.add_feature(cfeature.COASTLINE, linewidth=1.0)
+        ax.add_feature(cfeature.LAND, color='lightgray', alpha=0.7)
+        ax.add_feature(cfeature.OCEAN, color='lightblue', alpha=0.3)
+        
+        gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5)
+        gl.top_labels = False
+        gl.right_labels = False
+
+    def plot_monthly_lag_distribution(ax, lag_map, p_value_map, ocean_mask):
+        """Plot distribution of optimal monthly lags"""
+        lag_counts = {lag: 0 for lag in range(1, 13)}
+        
+        sig_mask = (p_value_map < 0.1) & ocean_mask
+        for lag in range(1, 13):
+            lag_count = np.sum((lag_map == lag) & sig_mask)
+            lag_counts[lag] = lag_count
+        
+        total = sum(lag_counts.values())
+        if total > 0:
+            # Create bar plot
+            lags = list(range(1, 13))
+            counts = [lag_counts[lag] for lag in lags]
+            
+            bars = ax.bar(lags, counts, color=plt.cm.viridis(np.linspace(0, 1, 12)))
+            ax.set_xlabel('Optimal Lag (Months)')
+            ax.set_ylabel('Number of Grid Points')
+            ax.set_title('Distribution of Optimal Monthly Lags\nAcross Significant Points', fontweight='bold', fontsize=10)
+            ax.grid(True, alpha=0.3)
+            
+            # Add value labels on bars
+            for bar, count in zip(bars, counts):
+                if count > 0:
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{count}', ha='center', va='bottom', fontsize=8)
+        else:
+            ax.text(0.5, 0.5, 'No significant points\ndetected', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Monthly Lag Distribution', fontweight='bold', fontsize=10)
+
+    def create_monthly_lag_plots(f_stat_maps, p_value_maps, lag_maps, r2_maps,
+                            lats, lons, ocean_mask, seasonal_results, seasons_data, nao_monthly, sst_monthly):
+        """Create visualization with 12 monthly lags information"""
+        
+        fig = plt.figure(figsize=(20, 16))
+        
+        # Grid specification
+        gs = plt.GridSpec(3, 3, figure=fig)
+        
+        # F-statistic map colored by optimal monthly lag
+        ax1 = fig.add_subplot(gs[0, 0], projection=ccrs.PlateCarree())
+        
+        f_stat_map = f_stat_maps['ALL']
+        p_value_map = p_value_maps['ALL']
+        lag_map = lag_maps['ALL']
+        
+        # Create combined plot showing F-statistics colored by optimal monthly lag
+        significant_mask = (p_value_map < 0.1) & ocean_mask
+        data_plot = np.where(significant_mask, f_stat_map, np.nan)
+        lag_plot = np.where(significant_mask, lag_map, np.nan)
+        
+        ax1.set_extent([-30, -5, 20, 42], crs=ccrs.PlateCarree())
+        
+        if np.any(~np.isnan(data_plot)):
+            # Use viridis colormap for continuous lag values
+            scatter = ax1.scatter(np.tile(lons, len(lats))[~np.isnan(data_plot.flatten())],
+                                np.repeat(lats, len(lons))[~np.isnan(data_plot.flatten())],
+                                c=lag_plot[~np.isnan(lag_plot)],
+                                s=20, cmap='viridis', alpha=0.7,
+                                transform=ccrs.PlateCarree())
+            
+            plt.colorbar(scatter, ax=ax1, orientation='horizontal',
+                        pad=0.05, shrink=0.8, label='Optimal Lag (Months)')
+        
+        add_map_features(ax1)
+        ax1.set_title('SST → NAO: F-statistic (Color by Optimal Monthly Lag)', fontweight='bold', fontsize=11)
+        
+        # Significance map
+        ax2 = fig.add_subplot(gs[0, 1], projection=ccrs.PlateCarree())
+        
+        sig_data = np.where((p_value_map < 0.1) & ocean_mask, 
+                        -np.log10(p_value_map), np.nan)
+        
+        ax2.set_extent([-30, -5, 20, 42], crs=ccrs.PlateCarree())
+        
+        if np.any(~np.isnan(sig_data)):
+            contourf = ax2.contourf(lons, lats, sig_data, levels=20,
+                                cmap='YlOrRd', transform=ccrs.PlateCarree())
+            plt.colorbar(contourf, ax=ax2, orientation='horizontal',
+                        pad=0.05, shrink=0.8, label='-log10(p-value)')
+        
+        add_map_features(ax2)
+        ax2.set_title('SST → NAO: Significance Level', fontweight='bold', fontsize=11)
+        
+        # Effect size map
+        ax3 = fig.add_subplot(gs[0, 2], projection=ccrs.PlateCarree())
+        
+        effect_data = np.where((p_value_map < 0.1) & ocean_mask, 
+                            r2_maps['ALL'], np.nan)
+        
+        ax3.set_extent([-30, -5, 20, 42], crs=ccrs.PlateCarree())
+        
+        if np.any(~np.isnan(effect_data)):
+            contourf = ax3.contourf(lons, lats, effect_data, levels=20,
+                                cmap='plasma', transform=ccrs.PlateCarree())
+            plt.colorbar(contourf, ax=ax3, orientation='horizontal',
+                        pad=0.05, shrink=0.8, label='ΔR² (Effect Size)')
+        
+        add_map_features(ax3)
+        ax3.set_title('SST → NAO: Effect Size (ΔR²)', fontweight='bold', fontsize=11)
+        
+        # Monthly lag distribution
+        ax4 = fig.add_subplot(gs[1, 0])
+        plot_monthly_lag_distribution(ax4, lag_map, p_value_map, ocean_mask)
+        
+        # Enhanced summary
+        ax5 = fig.add_subplot(gs[1, 1:])
+        ax5.axis('off')
+        
+        # Prepare detailed monthly lag results text
+        summary_text = "12-MONTH LAG SST-NAO ANALYSIS\n\n"
+        summary_text += "="*60 + "\n"
+        
+        # Grid-point results
+        sig_mask = (p_value_map < 0.1) & ocean_mask
+        total_sig = np.sum(sig_mask)
+        percent_sig = (total_sig / np.sum(ocean_mask)) * 100
+        
+        summary_text += f"SPATIAL DETECTION (All Months):\n"
+        summary_text += f"  Total significant: {total_sig} points ({percent_sig:.1f}%)\n\n"
+        
+        # Top lags
+        lag_counts = {}
+        for lag in range(1, 13):
+            lag_count = np.sum((lag_map == lag) & sig_mask)
+            if lag_count > 0:
+                lag_counts[lag] = lag_count
+        
+        if lag_counts:
+            summary_text += "TOP OPTIMAL MONTHLY LAGS:\n"
+            sorted_lags = sorted(lag_counts.items(), key=lambda x: x[1], reverse=True)
+            for lag, count in sorted_lags[:5]:
+                lag_percent = (count / total_sig) * 100
+                mean_r2 = np.nanmean(r2_maps['ALL'][(lag_map == lag) & sig_mask])
+                summary_text += f"  {lag} months: {count} points ({lag_percent:.1f}%), mean ΔR²={mean_r2:.4f}\n"
+        
+        summary_text += "\n" + "="*60 + "\n"
+        summary_text += "SEASONAL GRANGER RESULTS (Regional Means):\n\n"
+        
+        for season in ['DJF', 'MAM', 'JJA', 'SON']:
+            if season in seasonal_results:
+                sst_nao = seasonal_results[season].get('SST -> NAO', {})
+                nao_sst = seasonal_results[season].get('NAO -> SST', {})
+                
+                summary_text += f"{season}:\n"
+                
+                # SST → NAO
+                if sst_nao:
+                    significance = "**" if sst_nao['p_value'] < 0.05 else "*" if sst_nao['p_value'] < 0.1 else ""
+                    summary_text += f"  SST→NAO: p={sst_nao['p_value']:.3f}{significance} (lag {sst_nao['lag']}m), ΔR²={sst_nao['r2_diff']:.4f}\n"
+                else:
+                    summary_text += f"  SST→NAO: Not significant\n"
+                    
+                # NAO → SST
+                if nao_sst:
+                    significance = "**" if nao_sst['p_value'] < 0.05 else "*" if nao_sst['p_value'] < 0.1 else ""
+                    summary_text += f"  NAO→SST: p={nao_sst['p_value']:.3f}{significance} (lag {nao_sst['lag']}m), ΔR²={nao_sst['r2_diff']:.4f}\n"
+                else:
+                    summary_text += f"  NAO→SST: Not significant\n"
+                
+                summary_text += "\n"
+        
+        summary_text += "="*60 + "\n"
+        summary_text += "PHYSICAL INTERPRETATION:\n\n"
+        
+        summary_text += "• Lags 1-3 months: Short-term ocean response\n"
+        summary_text += "• Lags 4-6 months: Seasonal memory effects\n"
+        summary_text += "• Lags 7-9 months: Medium-term ocean inertia\n"
+        summary_text += "• Lags 10-12 months: Annual cycle persistence\n\n"
+        
+        summary_text += "• Mixed lags indicate complex temporal dynamics\n"
+        summary_text += "• Different regions respond at different timescales\n"
+
+        ax5.text(0.05, 0.98, summary_text, transform=ax5.transAxes, fontsize=8,
+                va='top', ha='left', linespacing=1.2, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.8))
+        
+        # Monthly correlation evolution
+        ax6 = fig.add_subplot(gs[2, :])
+        
+        # Calculate monthly correlations
+        monthly_corrs = []
+        months = range(1, 13)
+        
+        for month in months:
+            nao_month = nao_monthly[nao_monthly.index.month == month]
+            sst_month = sst_monthly[sst_monthly.index.month == month]
+            
+            common_index = nao_month.index.intersection(sst_month.index)
+            if len(common_index) > 10:
+                corr = nao_month.loc[common_index].corr(sst_month.loc[common_index])
+                monthly_corrs.append(corr)
+            else:
+                monthly_corrs.append(np.nan)
+        
+        months_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        
+        # Plot monthly correlation
+        ax6.plot(months_names, monthly_corrs, 'o-', color='purple', linewidth=3, markersize=8)
+        ax6.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+        ax6.set_ylabel('Correlation Coefficient', fontsize=12)
+        ax6.set_xlabel('Month', fontsize=12)
+        ax6.set_title('Monthly NAO-SST Correlation (All Years)', fontweight='bold', fontsize=14)
+        ax6.grid(True, alpha=0.3)
+        ax6.tick_params(axis='x', rotation=45)
+        
+        plt.tight_layout()
+        plt.savefig('monthly_lag_sst_nao_analysis.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+    def plot_enhanced_sst_to_nao_analysis(sst_file_path):
+        """
+        Enhanced SST→NAO analysis with 12 MONTHLY LAGS
+        """
+        print("=== 12-MONTH LAG SST → NAO ANALYSIS ===")
+        print("Testing optimal lags 1-12 months for complete temporal coverage")
+        
+        # Calculate indices
+        print("\n1. CALCULATING INDICES...")
+        nao_monthly = calculate_nao_index_netcdf_memory_efficient(sst_file_path)
+        sst_monthly = calculate_moroccan_sst_memory_efficient(sst_file_path)
+        
+        print(f"NAO: {len(nao_monthly)} months")
+        print(f"SST: {len(sst_monthly)} months")
+        
+        # Load spatial SST data
+        print("\n2. LOADING SPATIAL SST DATA...")
+        dataset = nc.Dataset(sst_file_path, 'r')
+        
+        lat_var = dataset.variables['latitude']
+        lon_var = dataset.variables['longitude']
+        sst_var = dataset.variables['sst']
+        time_var = dataset.variables['valid_time']
+        
+        # Convert time to datetime objects
+        times = nc.num2date(time_var[:], time_var.units)
+        regular_times = []
+        for t in times:
+            if hasattr(t, 'year'):
+                regular_times.append(datetime(t.year, t.month, t.day, t.hour, t.minute, t.second))
+            else:
+                regular_times.append(t)
+        
+        # Get coordinates
+        latitudes = lat_var[:]
+        longitudes = lon_var[:]
+        
+        # Convert longitude if needed
+        if longitudes.max() > 180:
+            longitudes = np.where(longitudes > 180, longitudes - 360, longitudes)
+        
+        # Focus region
+        lat_min, lat_max = 20, 42
+        lon_min, lon_max = -30, -5
+
+        # Find indices for our region
+        lat_indices = np.where((latitudes >= lat_min) & (latitudes <= lat_max))[0]
+        lon_indices = np.where((longitudes >= lon_min) & (longitudes <= lon_max))[0]
+        
+        region_lats = latitudes[lat_indices]
+        region_lons = longitudes[lon_indices]
+        
+        print(f"Region: {len(region_lats)} lats, {len(region_lons)} lons")
+        
+        # Create ocean mask
+        ocean_mask = create_comprehensive_ocean_mask(region_lats, region_lons)
+        ocean_points = np.sum(ocean_mask)
+        print(f"Ocean points: {ocean_points}")
+        
+        # Get all monthly time indices
+        all_indices = list(range(len(regular_times)))
+        
+        # Load monthly SST data in chunks
+        def load_monthly_sst_chunked(sst_var, time_indices, lat_indices, lon_indices, max_chunk_size=24):
+            n_times = len(time_indices)
+            n_lats = len(lat_indices)
+            n_lons = len(lon_indices)
+            sst_data = np.full((n_times, n_lats, n_lons), np.nan)
+            
+            print(f"Loading {n_times} monthly time steps...")
+            
+            for chunk_start in range(0, n_times, max_chunk_size):
+                chunk_end = min(chunk_start + max_chunk_size, n_times)
+                chunk_time_indices = time_indices[chunk_start:chunk_end]
+                
+                sst_chunk = sst_var[chunk_time_indices, :, :]
+                
+                for idx, time_idx in enumerate(chunk_time_indices):
+                    sst_full = sst_chunk[idx, :, :]
+                    if sst_full.max() > 200:
+                        sst_full = sst_full - 273.15
+                    sst_region = sst_full[lat_indices[:, np.newaxis], lon_indices]
+                    sst_data[chunk_start + idx] = sst_region
+            
+            return sst_data
+        
+        # Load all monthly SST data
+        sst_monthly_grid = load_monthly_sst_chunked(sst_var, all_indices, lat_indices, lon_indices)
+        dataset.close()
+        
+        # Align time series
+        min_length = min(len(nao_monthly), sst_monthly_grid.shape[0])
+        nao_monthly_aligned = nao_monthly.values[:min_length]
+        sst_monthly_aligned = sst_monthly_grid[:min_length, :, :]
+        
+        print(f"\nAligned monthly data: {min_length} months")
+        
+        # Perform monthly grid analysis with ALL 12 MONTHLY LAGS
+        f_stat_maps, p_value_maps, lag_maps, r2_maps = perform_monthly_grid_analysis(
+            nao_monthly, sst_monthly_aligned, region_lats, region_lons, ocean_mask
+        )
+        
+        # Perform traditional seasonal analysis with 12 monthly lags
+        print("\n3. PERFORMING SEASONAL ANALYSIS WITH 12 MONTHLY LAGS...")
+        seasons_data = prepare_seasonal_data(nao_monthly, sst_monthly)
+        seasonal_results = perform_seasonal_granger_analysis(seasons_data)
+        
+        # Create enhanced visualization with monthly lag information
+        print("\n4. CREATING 12-MONTH LAG VISUALIZATIONS...")
+        create_monthly_lag_plots(
+            f_stat_maps, p_value_maps, lag_maps, r2_maps,
+            region_lats, region_lons, ocean_mask,
+            seasonal_results, seasons_data,
+            nao_monthly, sst_monthly
+        )
+
+    # Run the 12-month lag analysis
+    if __name__ == "__main__":
+        sst_file_path = "C:/Users/moham/OneDrive/Documents/Climate_Project/dadefda24611707dd32599a670df250b.nc"
+        
+        print("=== 12-MONTH LAG SST → NAO ANALYSIS ===")
+        print("Testing optimal lags 1-12 months for complete annual coverage")
+        
+        plot_enhanced_sst_to_nao_analysis(sst_file_path)

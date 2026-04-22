@@ -19,14 +19,6 @@ The project investigates how climate change and atmospheric variability (North A
 - [Data Sources](#data-sources)
 - [Methods](#methods)
 - [Main Results](#main-results)
-- [Repository Structure](#repository-structure)
-- [Getting Started](#getting-started)
-  - [Dependencies](#dependencies)
-  - [Usage](#usage)
-- [Figures](#figures)
-- [Citation](#citation)
-- [License](#license)
-- [Acknowledgments](#acknowledgments)
 
 ## Overview
 
